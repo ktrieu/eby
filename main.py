@@ -13,10 +13,11 @@ The module docstring's first line becomes the command's help text.
 import argparse
 import sys
 
-from commands import download
+from commands import download, process_edata
 
 COMMANDS = {
     "download": download,
+    "process_edata": process_edata,
 }
 
 
