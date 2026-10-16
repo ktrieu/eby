@@ -4,11 +4,10 @@ Takes no arguments. Files are listed in `FILES`; raw_data/ is gitignored.
 """
 
 import argparse
-from pathlib import Path
 
 import requests
 
-RAW_DATA_DIR = Path(__file__).resolve().parent.parent / "raw_data"
+from paths import RAW_DATA_DIR
 
 # URL -> filename under raw_data/
 FILES: dict[str, str] = {
