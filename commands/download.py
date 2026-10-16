@@ -9,10 +9,13 @@ import requests
 
 from paths import RAW_DATA_DIR
 
+VP_RESULTS_CSV = "vp_results.csv"
+VA_RESULTS_CSV = "va_results.csv"
+
 # URL -> filename under raw_data/
 FILES: dict[str, str] = {
-    "https://catalogue.data.gov.bc.ca/dataset/44914a35-de9a-4830-ac48-870001ef8935/resource/4e7be8e3-0805-4f39-87f3-47c4c29e262d/download/provincial_voting_results_by_voting_place.csv": "vp_results.csv",
-    "https://catalogue.data.gov.bc.ca/dataset/44914a35-de9a-4830-ac48-870001ef8935/resource/fb40239e-b718-4a79-b18f-7a62139d9792/download/provincial_voting_results_by_va.csv": "va_results.csv",
+    "https://catalogue.data.gov.bc.ca/dataset/44914a35-de9a-4830-ac48-870001ef8935/resource/4e7be8e3-0805-4f39-87f3-47c4c29e262d/download/provincial_voting_results_by_voting_place.csv": VP_RESULTS_CSV,
+    "https://catalogue.data.gov.bc.ca/dataset/44914a35-de9a-4830-ac48-870001ef8935/resource/fb40239e-b718-4a79-b18f-7a62139d9792/download/provincial_voting_results_by_va.csv": VA_RESULTS_CSV
 }
 
 
