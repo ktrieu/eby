@@ -1,6 +1,6 @@
 """Process the raw elections CSVs in raw_data/.
 
-Takes no arguments. Run `download` first to fetch the input files.
+Takes no arguments.
 """
 
 import argparse
@@ -9,8 +9,10 @@ import sys
 
 import polars as pl
 
-from commands.download import VA_RESULTS_CSV, VP_RESULTS_CSV
 from paths import PROCESSED_DATA_DIR, RAW_DATA_DIR
+
+VP_RESULTS_CSV = "vp_results.csv"
+VA_RESULTS_CSV = "va_results.csv"
 
 OUTPUT_PARQUET = PROCESSED_DATA_DIR / "riding_results.parquet"
 
@@ -64,7 +66,7 @@ def read_frame(filename: str) -> pl.DataFrame:
 def run(args: argparse.Namespace) -> int:
     missing = [f for f in (VP_RESULTS_CSV, VA_RESULTS_CSV) if not (RAW_DATA_DIR / f).exists()]
     if missing:
-        print(f"missing {', '.join(missing)} in {RAW_DATA_DIR}; run `download` first", file=sys.stderr)
+        print(f"missing {', '.join(missing)} in {RAW_DATA_DIR}", file=sys.stderr)
         return 1
 
     # va_results covers 2005-2020 and vp_results 2022 onward, so rows don't overlap.
