@@ -1,0 +1,10 @@
+- finish downloading the shapefiles
+- reproject as many years as possible onto 2024
+- grab toplines for included years
+    - polling average from whoever atp, we'll deal with it later
+    - calculate stddev for polling numbers, covariance for major parties
+- build basic pymc model with logit swing
+- add covariates?
+ - incumbency, famous candidate
+ - census demographics
+ - check big misses from basic model to see where more factors are needed
