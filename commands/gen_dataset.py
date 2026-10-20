@@ -24,27 +24,18 @@ TOPLINES_CSV = RAW_DATA_DIR / "toplines.csv"
 
 OUTPUT_PARQUET = PROCESSED_DATA_DIR / "model_input.parquet"
 
-# Affiliations in the results grouped into parties; everyone else (minor
-# parties, independents, no affiliation) is "other". The Liberals and
-# Conservatives are one right-wing block: the Liberals (as BC United) dropped
-# out of 2024 and backed the Conservatives, so treating them as one party
-# gives every election a right-wing vote to swing from and to.
+# Affiliations in the results grouped into the toplines' party columns;
+# everyone else (minor parties, independents, no affiliation) is "other". The
+# Liberals and Conservatives stay separate here, even though the Liberals (as
+# BC United) dropped out of 2024; the model combines them if it wants to.
 PARTIES: dict[str, str] = {
     "BC NDP": "ndp",
-    "BC Liberal Party": "right",
+    "BC Liberal Party": "liberal",
     "BC Green Party": "green",
-    "Conservative": "right",
-    "Conservative Party": "right",
+    "Conservative": "conservative",
+    "Conservative Party": "conservative",
 }
-# The same grouping for the toplines' party columns.
-TOPLINE_PARTIES: dict[str, str] = {
-    "ndp": "ndp",
-    "liberal": "right",
-    "green": "green",
-    "conservative": "right",
-    "other": "other",
-}
-PARTY_ORDER = ["ndp", "right", "green", "other"]
+PARTY_ORDER = ["ndp", "liberal", "green", "conservative", "other"]
 
 # The party every logit is taken against. It ran in every riding in every
 # election, so it's never missing from the denominator.
@@ -119,10 +110,8 @@ def run(args: argparse.Namespace) -> int:
     )
     toplines = (
         pl.read_csv(TOPLINES_CSV)
-        .unpivot(list(TOPLINE_PARTIES), index="year", variable_name="party", value_name="votes")
-        .with_columns(pl.col("party").replace_strict(TOPLINE_PARTIES))
-        .group_by("year", "party")
-        .agg(pl.col("votes").sum().cast(pl.Float64), usable=pl.lit(True))
+        .unpivot(PARTY_ORDER, index="year", variable_name="party", value_name="votes")
+        .with_columns(pl.col("votes").cast(pl.Float64), usable=pl.lit(True))
     )
 
     # Make sure the toplines are the same votes the ridings add up to.
