@@ -1,9 +1,18 @@
-- finish downloading the shapefiles
-- reproject as many years as possible onto 2024
-- grab toplines for included years
+- ~~finish downloading the shapefiles~~
+- ~~reproject as many years as possible onto 2024~~
+- ~~grab toplines for included years~~
+    - just using the real toplines for now, we'll ignore polling error
     - polling average from whoever atp, we'll deal with it later
     - calculate stddev for polling numbers, covariance for major parties
-- build basic pymc model with logit swing
+- ~~build basic pymc model with logit swing~~
+- build 2024 backtest technology
+    - holdout 2024 from initial dataset
+    - load cholesky + nu from trained model and predict with 2024 data
+    - save parquet with point estimate, 50/90 confidence interval, vote share, winner, etc. for analysis
+- build prediction for 2026
+    - just dial in the polling average from wherever and avoid dealing with polling error for v1
+- add polling error
+    - do we really want to calculate an average?
 - add covariates?
  - incumbency, famous candidate
  - census demographics
