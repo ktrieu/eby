@@ -10,6 +10,9 @@ Results are given as raw votes (total, votes_<party>) and as each party's logit
 against the NDP (logit_<party> = log(party / NDP)); the NDP is the reference,
 so it has no logit. A riding's logit is null where the party got no votes or
 didn't run a candidate across enough of the riding to swing from.
+
+The Liberals and Conservatives also appear added together as "right"
+(votes_right, logit_right). Its logit is only null where neither got any votes.
 """
 
 import argparse
@@ -27,7 +30,8 @@ OUTPUT_PARQUET = PROCESSED_DATA_DIR / "model_input.parquet"
 # Affiliations in the results grouped into the toplines' party columns;
 # everyone else (minor parties, independents, no affiliation) is "other". The
 # Liberals and Conservatives stay separate here, even though the Liberals (as
-# BC United) dropped out of 2024; the model combines them if it wants to.
+# BC United) dropped out of 2024; the "right" columns add them together for
+# a model that wants them as one party.
 PARTIES: dict[str, str] = {
     "BC NDP": "ndp",
     "BC Liberal Party": "liberal",
@@ -90,10 +94,18 @@ def widen(frame: pl.DataFrame, by: list[str]) -> pl.DataFrame:
         usable = pl.col("usable").filter(pl.col("party") == party).first()
         return pl.when(usable & (votes(party) > 0)).then((votes(party) / votes(REFERENCE_PARTY)).log())
 
-    return frame.group_by(by).agg(
-        pl.col("votes").sum().alias("total"),
-        *(votes(p).alias(f"votes_{p}") for p in PARTY_ORDER),
-        *(logit(p).alias(f"logit_{p}") for p in LOGIT_PARTIES),
+    right = pl.col("votes_liberal") + pl.col("votes_conservative")
+    return (
+        frame.group_by(by)
+        .agg(
+            pl.col("votes").sum().alias("total"),
+            *(votes(p).alias(f"votes_{p}") for p in PARTY_ORDER),
+            *(logit(p).alias(f"logit_{p}") for p in LOGIT_PARTIES),
+        )
+        .with_columns(
+            right.alias("votes_right"),
+            pl.when(right > 0).then((right / pl.col(f"votes_{REFERENCE_PARTY}")).log()).alias("logit_right"),
+        )
     )
 
 
