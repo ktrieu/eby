@@ -24,28 +24,32 @@ TOPLINES_CSV = RAW_DATA_DIR / "toplines.csv"
 
 OUTPUT_PARQUET = PROCESSED_DATA_DIR / "model_input.parquet"
 
-# Affiliations in the results grouped into the toplines' party columns;
-# everyone else (minor parties, independents, no affiliation) is "other".
+# Affiliations in the results grouped into parties; everyone else (minor
+# parties, independents, no affiliation) is "other". The Liberals and
+# Conservatives are one right-wing block: the Liberals (as BC United) dropped
+# out of 2024 and backed the Conservatives, so treating them as one party
+# gives every election a right-wing vote to swing from and to.
 PARTIES: dict[str, str] = {
     "BC NDP": "ndp",
-    "BC Liberal Party": "liberal",
+    "BC Liberal Party": "right",
     "BC Green Party": "green",
-    "Conservative": "conservative",
-    "Conservative Party": "conservative",
+    "Conservative": "right",
+    "Conservative Party": "right",
 }
-PARTY_ORDER = ["ndp", "liberal", "green", "conservative", "other"]
+# The same grouping for the toplines' party columns.
+TOPLINE_PARTIES: dict[str, str] = {
+    "ndp": "ndp",
+    "liberal": "right",
+    "green": "green",
+    "conservative": "right",
+    "other": "other",
+}
+PARTY_ORDER = ["ndp", "right", "green", "other"]
 
 # The party every logit is taken against. It ran in every riding in every
 # election, so it's never missing from the denominator.
 REFERENCE_PARTY = "ndp"
 LOGIT_PARTIES = [p for p in PARTY_ORDER if p != REFERENCE_PARTY]
-
-# Parties folded into another when looking back from an election. The
-# Liberals (as BC United) dropped out of 2024 and backed the Conservatives, so
-# 2024's Conservatives swing from the 2020 Liberal + Conservative vote.
-MERGES: dict[int, dict[str, str]] = {
-    2024: {"liberal": "conservative"},
-}
 
 # Share of a 2023 riding's votes that must come from old ridings where the
 # party ran a candidate. Below this the result mostly reflects where the party
@@ -58,13 +62,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def as_previous(frame: pl.DataFrame, next_years: dict[int, int]) -> pl.DataFrame:
-    """Relabel each election as the one after it, merging parties per MERGES."""
-    frame = frame.with_columns(pl.col("year").replace_strict(next_years, default=None)).drop_nulls("year")
-    for year, merges in MERGES.items():
-        frame = frame.with_columns(
-            pl.when(pl.col("year") == year).then(pl.col("party").replace(merges)).otherwise("party").alias("party")
-        )
-    return frame
+    """Relabel each election as the one after it."""
+    return frame.with_columns(pl.col("year").replace_strict(next_years, default=None)).drop_nulls("year")
 
 
 def tally_results(results: pl.DataFrame) -> pl.DataFrame:
@@ -120,8 +119,10 @@ def run(args: argparse.Namespace) -> int:
     )
     toplines = (
         pl.read_csv(TOPLINES_CSV)
-        .unpivot(PARTY_ORDER, index="year", variable_name="party", value_name="votes")
-        .with_columns(pl.col("votes").cast(pl.Float64), usable=pl.lit(True))
+        .unpivot(list(TOPLINE_PARTIES), index="year", variable_name="party", value_name="votes")
+        .with_columns(pl.col("party").replace_strict(TOPLINE_PARTIES))
+        .group_by("year", "party")
+        .agg(pl.col("votes").sum().cast(pl.Float64), usable=pl.lit(True))
     )
 
     # Make sure the toplines are the same votes the ridings add up to.
