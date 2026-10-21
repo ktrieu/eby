@@ -13,9 +13,10 @@ The module docstring's first line becomes the command's help text.
 import argparse
 import sys
 
-from commands import fit_model, gen_dataset, process_edata, weight_ridings
+from commands import backtest, fit_model, gen_dataset, process_edata, weight_ridings
 
 COMMANDS = {
+    "backtest": backtest,
     "fit_model": fit_model,
     "gen_dataset": gen_dataset,
     "process_edata": process_edata,

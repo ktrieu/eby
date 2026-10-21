@@ -1,7 +1,9 @@
 """Fit the riding model to the dataset and save its posterior.
 
 Run gen_dataset first. Samples the model with PyMC and writes the trace to
-processed_data/trace.nc for later commands to read without refitting.
+processed_data/trace.nc (or the --output name in processed_data) for later
+commands to read without refitting. With --holdout, that year is left out of the fit and recorded in the
+trace for backtest to evaluate against.
 """
 
 import argparse
@@ -10,14 +12,11 @@ import sys
 import numpy as np
 import polars as pl
 import pymc as pm
-from scipy.special import logsumexp
-import xarray as xr
 
 from commands.gen_dataset import OUTPUT_PARQUET as MODEL_INPUT_PARQUET
-from commands.gen_dataset import TOPLINES_CSV
-from paths import PROCESSED_DATA_DIR
+from paths import processed_path
 
-OUTPUT_NETCDF = PROCESSED_DATA_DIR / "trace.nc"
+DEFAULT_TRACE = "trace.nc"
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -40,7 +39,13 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "--seed", type=int, default=None, help="random seed, for reproducible fits"
     )
     parser.add_argument(
-        "--holdout", type=int, default=None, help="holdout year to evaluate against"
+        "--holdout", type=int, default=None, help="year to leave out of the fit"
+    )
+    parser.add_argument(
+        "--output",
+        type=processed_path,
+        default=DEFAULT_TRACE,
+        help="trace file name, inside processed_data (default: %(default)s)",
     )
 
 
@@ -158,103 +163,11 @@ def run(args: argparse.Namespace) -> int:
         )
 
     if args.holdout:
-        test = dataset.filter(pl.col("year") == args.holdout)
-        test_model = build_model(test)
-        with test_model:
-            ppc = pm.sample_posterior_predictive(
-                trace, model=test_model, predictions=True
-            )
+        # recorded so backtest knows which year this trace never saw
+        trace.attrs["holdout"] = args.holdout
 
-        preds = ppc["predictions"]
-        # one table for each unique pattern. (chains, draw, parties_in_pattern, riding)
-        # parties_in_pattern can vary (if only two parties are running its two)
-        parts = [
-            preds[var].rename({f"riding_{tag}": "riding", f"party_{tag}": "party"})
-            for var in preds.data_vars
-            for tag in [var.removeprefix("logit_")]
-        ]
-
-        # glue together all our pieces along the riding column, essentially all our pieces into one big frame.
-        # join = "outer" fills in missing parties with NaN.
-        pred = xr.concat(parts, dim="riding", join="outer")
-        # reindex the parties to a fixed order across the whole frame.
-        pred = pred.reindex(party=MODEL_PARTIES)
-
-        # softmax each draw into vote shares. logits are against the NDP, which adds
-        # exp(0) = 1 to the denominator; a party that didn't run (NaN) gets 0 votes
-        e = np.exp(pred).fillna(0)
-        denom = 1 + e.sum("party")
-        shares = xr.concat(
-            [e / denom, (1 / denom).expand_dims(party=["ndp"])],
-            dim="party",
-        )
-        # concat leaves party as an object-dtype coord, which arrow can't convert
-        shares = shares.assign_coords(party=shares.party.astype(str))
-
-        shares = shares.stack(sample=("chain", "draw")).reset_index("sample")
-        shares.name = "share"
-        shares_df = pl.DataFrame(shares)
-
-        summary_cols = {
-            "mean": pl.col("share").mean(),
-            "p5": pl.col("share").quantile(0.05),
-            "p25": pl.col("share").quantile(0.25),
-            "p75": pl.col("share").quantile(0.75),
-            "p95": pl.col("share").quantile(0.95),
-        }
-
-        results = (
-            shares_df.group_by("riding", "party")
-            .agg(**summary_cols)
-            .pivot("party", values=summary_cols.keys())
-            .join(test, on="riding")
-        )
-
-        metric_parties = MODEL_PARTIES + ["ndp"]
-
-        metrics = results.select(
-            pl.col("riding"),
-            *[pl.col(f"{stat}_{p}") for stat in summary_cols for p in metric_parties],
-            *[
-                (pl.col(f"votes_{p}") / pl.col("total")).alias(f"actual_{p}")
-                for p in metric_parties
-            ],
-        )
-
-        # a party that didn't run has a null actual share, so its metrics are null
-        # too and drop out of the averages below
-        metrics = metrics.with_columns(
-            *[
-                (pl.col(f"mean_{p}") - pl.col(f"actual_{p}"))
-                .abs()
-                .alias(f"abs_error_{p}")
-                for p in metric_parties
-            ],
-            *[
-                pl.col(f"actual_{p}")
-                .is_between(pl.col(f"p5_{p}"), pl.col(f"p95_{p}"))
-                .alias(f"in_90_{p}")
-                for p in metric_parties
-            ],
-            *[
-                pl.col(f"actual_{p}")
-                .is_between(pl.col(f"p25_{p}"), pl.col(f"p75_{p}"))
-                .alias(f"in_50_{p}")
-                for p in metric_parties
-            ],
-        )
-
-        print(
-            metrics.select(
-                *[
-                    pl.col(f"{m}_{p}").mean()
-                    for m in ("abs_error", "in_90", "in_50")
-                    for p in metric_parties
-                ]
-            )
-        )
-
-    trace.to_netcdf(OUTPUT_NETCDF)
-    print(f"wrote trace to {OUTPUT_NETCDF}")
+    args.output.parent.mkdir(exist_ok=True)
+    trace.to_netcdf(args.output)
+    print(f"wrote trace to {args.output}")
 
     return 0
