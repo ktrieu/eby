@@ -5,7 +5,7 @@
     - polling average from whoever atp, we'll deal with it later
     - calculate stddev for polling numbers, covariance for major parties
 - ~~build basic pymc model with logit swing~~
-- build 2024 backtest technology
+- ~~build 2024 backtest technology~~
     - holdout 2024 from initial dataset
     - load cholesky + nu from trained model and predict with 2024 data
     - save parquet with point estimate, 50/90 confidence interval, vote share, winner, etc. for analysis
