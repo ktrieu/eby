@@ -34,6 +34,7 @@ from commands.fit_model import (
     DEFAULT_TRACE,
     DEMOG_COLS,
     INCUMBENT_COLS,
+    LEFT_OTHER_COL,
     MODEL_PARTIES,
     PREV_INCUMBENT_COLS,
     load_dataset,
@@ -98,7 +99,7 @@ def build_frame(
     the previous ones, and the topline is the one given."""
     return (
         dataset.filter(pl.col("year") == PREV_YEAR)
-        .drop(PREV_INCUMBENT_COLS)
+        .drop(*PREV_INCUMBENT_COLS, LEFT_OTHER_COL)
         .rename(dict(zip(INCUMBENT_COLS, PREV_INCUMBENT_COLS)))
         .join(candidates, on="riding", validate="1:1")
         .filter(pl.col("running_ndp"))
@@ -133,6 +134,7 @@ def build_frame(
             *DEMOG_COLS,
             *INCUMBENT_COLS,
             *PREV_INCUMBENT_COLS,
+            LEFT_OTHER_COL,
         )
     )
 

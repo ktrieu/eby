@@ -26,7 +26,9 @@ covering at least MIN_COVERAGE of the votes. incumbent_<party> is the share of
 the riding's voters whose MLA from the previous election is on their ballot
 again running for that party, except MLAs who won for a party and now run as
 "other" (an independent or minor party candidate), who are in switched_other
-instead. Across a boundary change we only
+instead. left_other is the share whose previous other candidate (not an
+ex-MLA) now runs for a party, taking their personal vote off the other line.
+Across a boundary change we only
 know how each map's ridings split the 2023 riding, not how they overlap each
 other, so we take an old riding and the new riding its MLA runs in to share
 as much of the 2023 riding as they can, the smaller of their two shares.
@@ -61,6 +63,11 @@ MODEL_PARTY: dict[str, str] = {
 }
 RUNNING_PARTIES = ["green", "right", "other", "ndp"]
 
+# Share of their riding's vote an other candidate needs before leaving for a
+# party counts as taking a personal vote with them. Below this they're most
+# likely a minor party's usual few percent.
+MIN_PERSONAL_SHARE = 0.05
+
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     pass
@@ -86,6 +93,25 @@ def read_2026() -> pl.DataFrame:
     )
 
 
+def keyed(frame: pl.DataFrame) -> pl.DataFrame:
+    """Add each "Last, First" candidate's lowercase surname and first given name."""
+    name = pl.col("candidate").str.split_exact(", ", 1)
+    return frame.with_columns(
+        name.struct.field("field_0").str.to_lowercase().alias("last"),
+        name.struct.field("field_1").str.split(" ").list.first().str.to_lowercase().alias("first"),
+    )
+
+
+def riding_pieces(results: pl.DataFrame) -> pl.DataFrame:
+    """How each election's ridings split up each 2023 riding, as (year, riding, new_riding, share)."""
+    return (
+        results.group_by("year", "riding", "riding_2024")
+        .agg(pl.col("votes").sum())
+        .with_columns((pl.col("votes") / pl.col("votes").sum().over("year", "riding_2024")).alias("share"))
+        .select("year", "riding", pl.col("riding_2024").alias("new_riding"), "share")
+    )
+
+
 def match_incumbents(candidates: pl.DataFrame, prev: int, year: int) -> pl.DataFrame:
     """Find where each winner of the prev election ran in year, as (prev_riding, prev_party, riding, candidate) rows.
 
@@ -93,14 +119,6 @@ def match_incumbents(candidates: pl.DataFrame, prev: int, year: int) -> pl.DataF
     Gregory), so a winner matches a candidate with the same surname whose first
     name starts with theirs, or the other way around.
     """
-
-    def keyed(frame: pl.DataFrame) -> pl.DataFrame:
-        name = pl.col("candidate").str.split_exact(", ", 1)
-        return frame.with_columns(
-            name.struct.field("field_0").str.to_lowercase().alias("last"),
-            name.struct.field("field_1").str.split(" ").list.first().str.to_lowercase().alias("first"),
-        )
-
     winners = keyed(candidates.filter((pl.col("year") == prev) & pl.col("elected")))
     running = keyed(candidates.filter(pl.col("year") == year))
     return (
@@ -122,13 +140,7 @@ def incumbency(results: pl.DataFrame, candidates: pl.DataFrame, matches: pl.Data
     matches has each incumbent running again, as (year, prev_riding,
     prev_party, riding, candidate).
     """
-    # how each election's ridings split up each 2023 riding
-    pieces = (
-        results.group_by("year", "riding", "riding_2024")
-        .agg(pl.col("votes").sum())
-        .with_columns((pl.col("votes") / pl.col("votes").sum().over("year", "riding_2024")).alias("share"))
-        .select("year", "riding", pl.col("riding_2024").alias("new_riding"), "share")
-    )
+    pieces = riding_pieces(results)
 
     # the party each incumbent runs for now. one who won for a party and now
     # runs as an independent or for a minor party is counted apart, since they
@@ -181,6 +193,48 @@ def incumbency(results: pl.DataFrame, candidates: pl.DataFrame, matches: pl.Data
             share("other", True).alias("switched_other"),
         )
     )
+
+
+def left_other(results: pl.DataFrame, candidates: pl.DataFrame) -> pl.DataFrame:
+    """Share of each 2023 riding's voters whose previous other candidate now runs for a party.
+
+    Their personal vote leaves the other line with them, wherever they run
+    now, so this only needs where they ran before. Only candidates with at
+    least MIN_PERSONAL_SHARE of their riding's vote count, and ex-MLAs running
+    as other are left out, since switched_other already counts them.
+    """
+    pieces = riding_pieces(results)
+    vote_shares = (
+        results.group_by("year", "riding", "candidate")
+        .agg(pl.col("votes").sum())
+        .with_columns((pl.col("votes") / pl.col("votes").sum().over("year", "riding")).alias("vote_share"))
+        .drop("votes")
+    )
+    years = sorted(candidates["year"].unique())
+    rows = []
+    for prev, year in zip(years, years[1:]):
+        left = keyed(
+            candidates.filter((pl.col("year") == prev) & (pl.col("party") == "other") & ~pl.col("incumbent"))
+            .join(vote_shares, on=["year", "riding", "candidate"])
+            .filter(pl.col("vote_share") >= MIN_PERSONAL_SHARE)
+        )
+        now = candidates.filter((pl.col("year") == year) & (pl.col("party") != "other"))
+        if year == 2026:
+            # 2026 names are "First Last", and surnames can be more than one word
+            now = now.select(
+                pl.col("candidate").str.to_lowercase().alias("full"),
+                pl.col("candidate").str.split(" ").list.first().str.to_lowercase().alias("first"),
+            )
+            moved = left.join(now, on="first").filter(pl.col("full").str.ends_with(" " + pl.col("last")))
+        else:
+            moved = left.join(keyed(now).select("last", "first"), on=["last", "first"])
+        rows.append(
+            moved.select("year", "riding")
+            .unique()
+            .join(pieces, on=["year", "riding"])
+            .select(pl.lit(year, dtype=pl.Int64).alias("year"), pl.col("new_riding").alias("riding"), "share")
+        )
+    return pl.concat(rows).group_by("year", "riding").agg(pl.col("share").sum().alias("left_other"))
 
 
 def running(frame: pl.DataFrame) -> pl.DataFrame:
@@ -273,7 +327,8 @@ def run(args: argparse.Namespace) -> int:
             ]
         )
         .join(incumbency(results, candidates, matches), on=["year", "riding"], how="left")
-        .with_columns(pl.col(*(f"incumbent_{p}" for p in RUNNING_PARTIES), "switched_other").fill_null(0.0))
+        .join(left_other(results, candidates), on=["year", "riding"], how="left")
+        .with_columns(pl.col(*(f"incumbent_{p}" for p in RUNNING_PARTIES), "switched_other", "left_other").fill_null(0.0))
         .sort("year", "riding")
     )
 

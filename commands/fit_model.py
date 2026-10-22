@@ -65,6 +65,8 @@ INCUMBENT_COLS = [f"incumbent_{p}" for p in MODEL_PARTIES + ["ndp"]] + [
     "switched_other"
 ]
 PREV_INCUMBENT_COLS = [f"prev_{c}" for c in INCUMBENT_COLS]
+# already a change since the last election, so it has no prev_ column
+LEFT_OTHER_COL = "left_other"
 
 
 def load_dataset() -> pl.DataFrame | None:
@@ -84,11 +86,13 @@ def load_dataset() -> pl.DataFrame | None:
 
     demog = pl.read_parquet(DEMOG_PARQUET).select("year", "riding", *DEMOG_COLS)
     incumbency = pl.read_parquet(RIDING_CANDIDATES_PARQUET).select(
-        "year", "riding", *INCUMBENT_COLS
+        "year", "riding", *INCUMBENT_COLS, LEFT_OTHER_COL
     )
     years = incumbency["year"].unique().sort().to_list()
-    prev_incumbency = as_previous(incumbency, dict(zip(years, years[1:]))).rename(
-        dict(zip(INCUMBENT_COLS, PREV_INCUMBENT_COLS))
+    prev_incumbency = (
+        as_previous(incumbency, dict(zip(years, years[1:])))
+        .drop(LEFT_OTHER_COL)
+        .rename(dict(zip(INCUMBENT_COLS, PREV_INCUMBENT_COLS)))
     )
     return (
         pl.read_parquet(MODEL_INPUT_PARQUET)
@@ -146,10 +150,14 @@ def build_model(dataset: pl.DataFrame) -> pm.Model:
     )
     incumbency_swing = incumbent - prev_incumbent
 
-    # an MLA who left their party to run as other only moves other's logit
+    # an MLA who left their party to run as other only moves other's logit. a
+    # strong other candidate who now runs for a party takes the same kind of
+    # personal vote off the other line
     switched_swing = np.zeros_like(incumbency_swing)
     switched_swing[:, MODEL_PARTIES.index("other")] = (
-        dataset["switched_other"] - dataset["prev_switched_other"]
+        dataset["switched_other"]
+        - dataset["prev_switched_other"]
+        - dataset[LEFT_OTHER_COL]
     ).to_numpy()
 
     # one row for each observation, each column is a boolean: "do we have NaNs for this party"?
