@@ -27,7 +27,8 @@ the riding's voters whose MLA from the previous election is on their ballot
 again running for that party, except MLAs who won for a party and now run as
 "other" (an independent or minor party candidate), who are in switched_other
 instead. left_other is the share whose previous other candidate (not an
-ex-MLA) now runs for a party, taking their personal vote off the other line.
+ex-MLA, and with at least MIN_PERSONAL_SHARE of the vote) isn't running as
+other again, taking their personal vote off the other line.
 Across a boundary change we only
 know how each map's ridings split the 2023 riding, not how they overlap each
 other, so we take an old riding and the new riding its MLA runs in to share
@@ -196,12 +197,13 @@ def incumbency(results: pl.DataFrame, candidates: pl.DataFrame, matches: pl.Data
 
 
 def left_other(results: pl.DataFrame, candidates: pl.DataFrame) -> pl.DataFrame:
-    """Share of each 2023 riding's voters whose previous other candidate now runs for a party.
+    """Share of each 2023 riding's voters whose previous other candidate isn't running as other again.
 
-    Their personal vote leaves the other line with them, wherever they run
-    now, so this only needs where they ran before. Only candidates with at
-    least MIN_PERSONAL_SHARE of their riding's vote count, and ex-MLAs running
-    as other are left out, since switched_other already counts them.
+    Whether they now run for a party or not at all, their personal vote leaves
+    the other line with them, so this only needs where they ran before. Only
+    candidates with at least MIN_PERSONAL_SHARE of their riding's vote count,
+    and ex-MLAs running as other are left out, since switched_other already
+    counts them.
     """
     pieces = riding_pieces(results)
     vote_shares = (
@@ -213,23 +215,24 @@ def left_other(results: pl.DataFrame, candidates: pl.DataFrame) -> pl.DataFrame:
     years = sorted(candidates["year"].unique())
     rows = []
     for prev, year in zip(years, years[1:]):
-        left = keyed(
+        strong = keyed(
             candidates.filter((pl.col("year") == prev) & (pl.col("party") == "other") & ~pl.col("incumbent"))
             .join(vote_shares, on=["year", "riding", "candidate"])
             .filter(pl.col("vote_share") >= MIN_PERSONAL_SHARE)
         )
-        now = candidates.filter((pl.col("year") == year) & (pl.col("party") != "other"))
+        now = candidates.filter((pl.col("year") == year) & (pl.col("party") == "other"))
         if year == 2026:
             # 2026 names are "First Last", and surnames can be more than one word
             now = now.select(
                 pl.col("candidate").str.to_lowercase().alias("full"),
                 pl.col("candidate").str.split(" ").list.first().str.to_lowercase().alias("first"),
             )
-            moved = left.join(now, on="first").filter(pl.col("full").str.ends_with(" " + pl.col("last")))
+            stayed = strong.join(now, on="first").filter(pl.col("full").str.ends_with(" " + pl.col("last")))
         else:
-            moved = left.join(keyed(now).select("last", "first"), on=["last", "first"])
+            stayed = strong.join(keyed(now).select("last", "first"), on=["last", "first"])
+        left = strong.join(stayed.select("riding", "candidate"), on=["riding", "candidate"], how="anti")
         rows.append(
-            moved.select("year", "riding")
+            left.select("year", "riding")
             .unique()
             .join(pieces, on=["year", "riding"])
             .select(pl.lit(year, dtype=pl.Int64).alias("year"), pl.col("new_riding").alias("riding"), "share")
