@@ -106,6 +106,7 @@ def build_frame(
         .select(
             pl.lit(YEAR).alias("year"),
             "riding",
+            "region",
             # a party not running has no logit. one running without a 2024
             # logit starts from the province-wide one
             *[

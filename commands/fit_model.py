@@ -19,7 +19,7 @@ from commands.gen_candidates import RIDING_CANDIDATES_PARQUET
 from commands.gen_dataset import OUTPUT_PARQUET as MODEL_INPUT_PARQUET
 from commands.gen_dataset import as_previous
 from commands.gen_demog import OUTPUT_PARQUET as DEMOG_PARQUET
-from paths import processed_path
+from paths import RAW_DATA_DIR, processed_path
 
 DEFAULT_TRACE = "trace.nc"
 
@@ -68,13 +68,21 @@ PREV_INCUMBENT_COLS = [f"prev_{c}" for c in INCUMBENT_COLS]
 # already a change since the last election, so it has no prev_ column
 LEFT_OTHER_COL = "left_other"
 
+# the region each 2023 riding is in, for regional swings
+REGIONS_CSV = RAW_DATA_DIR / "regions.csv"
+
 
 def load_dataset() -> pl.DataFrame | None:
     """Read the model input with each riding's demographics and incumbency
     joined on, or print what's missing and return None."""
     missing = [
         p
-        for p in (MODEL_INPUT_PARQUET, DEMOG_PARQUET, RIDING_CANDIDATES_PARQUET)
+        for p in (
+            MODEL_INPUT_PARQUET,
+            DEMOG_PARQUET,
+            RIDING_CANDIDATES_PARQUET,
+            REGIONS_CSV,
+        )
         if not p.exists()
     ]
     if missing:
@@ -99,6 +107,7 @@ def load_dataset() -> pl.DataFrame | None:
         .join(demog, on=["year", "riding"], how="left", validate="1:1")
         .join(incumbency, on=["year", "riding"], how="left", validate="1:1")
         .join(prev_incumbency, on=["year", "riding"], how="left", validate="1:1")
+        .join(pl.read_csv(REGIONS_CSV), on="riding", how="left", validate="m:1")
         # a party with nothing to swing from (it didn't run last time, or not
         # across enough of the riding) starts from the province-wide logit, as
         # if the riding were average. predict does the same for 2026
@@ -113,14 +122,19 @@ def load_dataset() -> pl.DataFrame | None:
 
 def build_model(dataset: pl.DataFrame) -> pm.Model:
     """Build the logit swing model: each riding's result is its previous result
-    shifted on the logit scale by the province-wide swing, a demographic
-    effect and the change in incumbency, plus riding noise."""
+    shifted on the logit scale by the province-wide swing, its region's swing
+    that election, a demographic effect and the change in incumbency, plus
+    riding noise."""
+
+    years = dataset["year"].unique().sort().to_list()
+    regions = pl.read_csv(REGIONS_CSV)["region"].unique().sort().to_list()
 
     # right is lib + con
     coords = {
         "party": MODEL_PARTIES,
         "party_": MODEL_PARTIES,
-        "year": dataset["year"].unique().sort().to_list(),
+        "year": years,
+        "region": regions,
         "riding": dataset["riding"].unique().sort().to_list(),
         "demog": DEMOG_COLS,
         # the index of each row in the dataset
@@ -191,9 +205,20 @@ def build_model(dataset: pl.DataFrame) -> pm.Model:
         # this can be several times larger on the logit scale
         switched_other = pm.Normal("switched_other", mu=0, sigma=2)
 
+        # each region swings a little differently from the province in each
+        # election (Surrey and the Island went much further right in 2024), so
+        # these are fresh every election, pooled by how far regions usually
+        # stray. an election the trace never saw draws new ones
+        region_sigma = pm.HalfNormal("region_sigma", sigma=0.3, dims="party")
+        region_z = pm.Normal("region_z", mu=0, sigma=1, dims=("year", "region", "party"))
+        region_swing = region_z * region_sigma
+        year_index = np.searchsorted(years, dataset["year"].to_numpy())
+        region_index = np.searchsorted(regions, dataset["region"].to_numpy())
+
         predicted_logit = (
             prev_logit
             + topline_swing
+            + region_swing[year_index, region_index]
             + demog @ beta.T
             + incumbency * incumbency_swing
             + switched_other * switched_swing
@@ -251,8 +276,15 @@ def predict_shares(
     didn't run gets a share of 0."""
     model = build_model(dataset)
     with model:
+        # the regional swings for these elections weren't in the fit, so draw
+        # them fresh from region_sigma. pymc would pass the trace's (the
+        # training elections') straight through, so drop them first
         ppc = pm.sample_posterior_predictive(
-            trace, model=model, predictions=True, random_seed=seed
+            trace.posterior.to_dataset().drop_vars("region_z", errors="ignore"),
+            model=model,
+            var_names=["region_z", *(v.name for v in model.observed_RVs)],
+            predictions=True,
+            random_seed=seed,
         )
 
     preds = ppc["predictions"]
@@ -261,6 +293,7 @@ def predict_shares(
     parts = [
         preds[var].rename({f"riding_{tag}": "riding", f"party_{tag}": "party"})
         for var in preds.data_vars
+        if var.startswith("logit_")
         for tag in [var.removeprefix("logit_")]
     ]
 
