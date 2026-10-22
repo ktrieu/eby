@@ -1,6 +1,6 @@
 """Fit the riding model to the dataset and save its posterior.
 
-Run gen_dataset and gen_demog first. Samples the model with PyMC and writes the trace to
+Run gen_dataset, gen_demog and gen_candidates first. Samples the model with PyMC and writes the trace to
 processed_data/trace.nc (or the --output name in processed_data) for later
 commands to read without refitting. With --holdout, that year is left out of the fit and recorded in the
 trace for backtest to evaluate against.
@@ -15,7 +15,9 @@ import polars as pl
 import pymc as pm
 import xarray as xr
 
+from commands.gen_candidates import RIDING_CANDIDATES_PARQUET
 from commands.gen_dataset import OUTPUT_PARQUET as MODEL_INPUT_PARQUET
+from commands.gen_dataset import as_previous
 from commands.gen_demog import OUTPUT_PARQUET as DEMOG_PARQUET
 from paths import processed_path
 
@@ -57,28 +59,46 @@ MODEL_PARTIES = ["green", "right", "other"]
 # standardized census rates from gen_demog, each with a fixed effect per party
 DEMOG_COLS = ["postsecondary_z", "visible_minority_z"]
 
+# each party's incumbency from gen_candidates, this election and the last
+INCUMBENT_COLS = [f"incumbent_{p}" for p in MODEL_PARTIES + ["ndp"]]
+PREV_INCUMBENT_COLS = [f"prev_{c}" for c in INCUMBENT_COLS]
+
 
 def load_dataset() -> pl.DataFrame | None:
-    """Read the model input with each riding's demographics joined on, or
-    print what's missing and return None."""
-    missing = [p for p in (MODEL_INPUT_PARQUET, DEMOG_PARQUET) if not p.exists()]
+    """Read the model input with each riding's demographics and incumbency
+    joined on, or print what's missing and return None."""
+    missing = [
+        p
+        for p in (MODEL_INPUT_PARQUET, DEMOG_PARQUET, RIDING_CANDIDATES_PARQUET)
+        if not p.exists()
+    ]
     if missing:
         print(
-            f"missing {', '.join(map(str, missing))} (run gen_dataset and gen_demog first?)",
+            f"missing {', '.join(map(str, missing))} (run gen_dataset, gen_demog and gen_candidates first?)",
             file=sys.stderr,
         )
         return None
 
     demog = pl.read_parquet(DEMOG_PARQUET).select("year", "riding", *DEMOG_COLS)
-    return pl.read_parquet(MODEL_INPUT_PARQUET).join(
-        demog, on=["year", "riding"], how="left", validate="1:1"
+    incumbency = pl.read_parquet(RIDING_CANDIDATES_PARQUET).select(
+        "year", "riding", *INCUMBENT_COLS
+    )
+    years = incumbency["year"].unique().sort().to_list()
+    prev_incumbency = as_previous(incumbency, dict(zip(years, years[1:]))).rename(
+        dict(zip(INCUMBENT_COLS, PREV_INCUMBENT_COLS))
+    )
+    return (
+        pl.read_parquet(MODEL_INPUT_PARQUET)
+        .join(demog, on=["year", "riding"], how="left", validate="1:1")
+        .join(incumbency, on=["year", "riding"], how="left", validate="1:1")
+        .join(prev_incumbency, on=["year", "riding"], how="left", validate="1:1")
     )
 
 
 def build_model(dataset: pl.DataFrame) -> pm.Model:
     """Build the logit swing model: each riding's result is its previous result
-    shifted on the logit scale by the province-wide swing and a demographic
-    effect, plus riding noise."""
+    shifted on the logit scale by the province-wide swing, a demographic
+    effect and the change in incumbency, plus riding noise."""
 
     # right is lib + con
     coords = {
@@ -101,6 +121,18 @@ def build_model(dataset: pl.DataFrame) -> pm.Model:
     ).to_numpy()
     topline_swing = topline_logit - prev_topline_logit
     demog = dataset.select(DEMOG_COLS).to_numpy()
+
+    # logits are against the NDP, so an NDP incumbent counts against every
+    # other party. the previous result already has last election's incumbency
+    # in it, so only the change since then moves the swing
+    incumbent, prev_incumbent = (
+        dataset.select(
+            pl.col(f"{prefix}incumbent_{p}") - pl.col(f"{prefix}incumbent_ndp")
+            for p in MODEL_PARTIES
+        ).to_numpy()
+        for prefix in ("", "prev_")
+    )
+    incumbency_swing = incumbent - prev_incumbent
 
     # one row for each observation, each column is a boolean: "do we have NaNs for this party"?
     valid = ~np.isnan(logit) & ~np.isnan(prev_logit) & ~np.isnan(topline_swing)
@@ -125,7 +157,16 @@ def build_model(dataset: pl.DataFrame) -> pm.Model:
         # demographic, the same in every election
         beta = pm.Normal("beta", mu=0, sigma=0.25, dims=("party", "demog"))
 
-        predicted_logit = prev_logit + topline_swing + demog @ beta.T
+        # how much an incumbent on the ballot moves their party's logit, the
+        # same for every party and election
+        incumbency = pm.Normal("incumbency", mu=0, sigma=0.25)
+
+        predicted_logit = (
+            prev_logit
+            + topline_swing
+            + demog @ beta.T
+            + incumbency * incumbency_swing
+        )
 
         # Some rows have nulls (Green for example). We have to split these up and handle them with separate distributions.
 

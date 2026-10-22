@@ -3,7 +3,8 @@
 Run fit_model first, without --holdout so the fit has seen 2024. Swings each
 riding from its 2024 result by the change from the 2024 topline to the one
 given (--ndp, --right, --green, --other, in percent; only their ratios matter,
-so they needn't add to 100), using the 2024 demographics.
+so they needn't add to 100), using the 2024 demographics, and moves it by
+the change from the 2024 incumbents to the sitting MLAs running in 2026.
 
 Run gen_candidates first too: who runs where comes from its 2026 rows. The
 Conservatives are "right", and CentreBC, OneBC and everyone else are
@@ -31,7 +32,9 @@ import xarray as xr
 from commands.fit_model import (
     DEFAULT_TRACE,
     DEMOG_COLS,
+    INCUMBENT_COLS,
     MODEL_PARTIES,
+    PREV_INCUMBENT_COLS,
     load_dataset,
     predict_shares,
 )
@@ -90,10 +93,12 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 def build_frame(
     dataset: pl.DataFrame, candidates: pl.DataFrame, topline: dict[str, float]
 ) -> pl.DataFrame:
-    """Turn the 2024 rows into 2026 rows: 2024's results become the previous
-    ones, and the topline is the one given."""
+    """Turn the 2024 rows into 2026 rows: 2024's results and incumbency become
+    the previous ones, and the topline is the one given."""
     return (
         dataset.filter(pl.col("year") == PREV_YEAR)
+        .drop(PREV_INCUMBENT_COLS)
+        .rename(dict(zip(INCUMBENT_COLS, PREV_INCUMBENT_COLS)))
         .join(candidates, on="riding", validate="1:1")
         .filter(pl.col("running_ndp"))
         .select(
@@ -125,6 +130,8 @@ def build_frame(
                 for p in MODEL_PARTIES
             ],
             *DEMOG_COLS,
+            *INCUMBENT_COLS,
+            *PREV_INCUMBENT_COLS,
         )
     )
 
