@@ -59,11 +59,10 @@ MODEL_PARTIES = ["green", "right", "other"]
 # standardized census rates from gen_demog, each with a fixed effect per party
 DEMOG_COLS = ["postsecondary_z", "visible_minority_z"]
 
-# each party's incumbency from gen_candidates, this election and the last:
-# incumbents running for the party they won for, and those who switched
-INCUMBENCY_KINDS = ["incumbent", "switched"]
-INCUMBENT_COLS = [
-    f"{kind}_{p}" for kind in INCUMBENCY_KINDS for p in MODEL_PARTIES + ["ndp"]
+# each party's incumbency from gen_candidates, this election and the last,
+# and incumbents who won for a party but now run as other
+INCUMBENT_COLS = [f"incumbent_{p}" for p in MODEL_PARTIES + ["ndp"]] + [
+    "switched_other"
 ]
 PREV_INCUMBENT_COLS = [f"prev_{c}" for c in INCUMBENT_COLS]
 
@@ -138,18 +137,20 @@ def build_model(dataset: pl.DataFrame) -> pm.Model:
     # logits are against the NDP, so an NDP incumbent counts against every
     # other party. the previous result already has last election's incumbency
     # in it, so only the change since then moves the swing
-    def incumbency_swing(kind: str) -> np.ndarray:
-        now, prev = (
-            dataset.select(
-                pl.col(f"{prefix}{kind}_{p}") - pl.col(f"{prefix}{kind}_ndp")
-                for p in MODEL_PARTIES
-            ).to_numpy()
-            for prefix in ("", "prev_")
-        )
-        return now - prev
+    incumbent, prev_incumbent = (
+        dataset.select(
+            pl.col(f"{prefix}incumbent_{p}") - pl.col(f"{prefix}incumbent_ndp")
+            for p in MODEL_PARTIES
+        ).to_numpy()
+        for prefix in ("", "prev_")
+    )
+    incumbency_swing = incumbent - prev_incumbent
 
-    stayed_swing = incumbency_swing("incumbent")
-    switched_swing = incumbency_swing("switched")
+    # an MLA who left their party to run as other only moves other's logit
+    switched_swing = np.zeros_like(incumbency_swing)
+    switched_swing[:, MODEL_PARTIES.index("other")] = (
+        dataset["switched_other"] - dataset["prev_switched_other"]
+    ).to_numpy()
 
     # one row for each observation, each column is a boolean: "do we have NaNs for this party"?
     valid = ~np.isnan(logit) & ~np.isnan(prev_logit) & ~np.isnan(topline_swing)
@@ -175,17 +176,19 @@ def build_model(dataset: pl.DataFrame) -> pm.Model:
         beta = pm.Normal("beta", mu=0, sigma=0.25, dims=("party", "demog"))
 
         # how much an incumbent on the ballot moves their party's logit, the
-        # same for every party and election. one who switched parties may take
-        # more or less of their vote with them
+        # same for every party and election
         incumbency = pm.Normal("incumbency", mu=0, sigma=0.25)
-        switched_incumbency = pm.Normal("switched_incumbency", mu=0, sigma=0.25)
+        # an MLA running as other after leaving their party takes a personal
+        # vote with them, from a party that usually gets a few percent, so
+        # this can be several times larger on the logit scale
+        switched_other = pm.Normal("switched_other", mu=0, sigma=2)
 
         predicted_logit = (
             prev_logit
             + topline_swing
             + demog @ beta.T
-            + incumbency * stayed_swing
-            + switched_incumbency * switched_swing
+            + incumbency * incumbency_swing
+            + switched_other * switched_swing
         )
 
         # Some rows have nulls (Green for example). We have to split these up and handle them with separate distributions.

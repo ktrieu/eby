@@ -24,9 +24,9 @@ other) ran: before 2024 the ridings were different, so it's whether
 gen_dataset counts the party as contesting it, its candidates' old ridings
 covering at least MIN_COVERAGE of the votes. incumbent_<party> is the share of
 the riding's voters whose MLA from the previous election is on their ballot
-again running for that party, the party they won the seat for, and
-switched_<party> the same for MLAs now running for that party after winning
-for another (Liberal to Conservative counts). Across a boundary change we only
+again running for that party, except MLAs who won for a party and now run as
+"other" (an independent or minor party candidate), who are in switched_other
+instead. Across a boundary change we only
 know how each map's ridings split the 2023 riding, not how they overlap each
 other, so we take an old riding and the new riding its MLA runs in to share
 as much of the 2023 riding as they can, the smaller of their two shares.
@@ -130,15 +130,15 @@ def incumbency(results: pl.DataFrame, candidates: pl.DataFrame, matches: pl.Data
         .select("year", "riding", pl.col("riding_2024").alias("new_riding"), "share")
     )
 
-    # the party each incumbent runs for now, which may not be the one they won
-    # for. a switch between the Liberals and Conservatives counts, even though
-    # both are right
+    # the party each incumbent runs for now. one who won for a party and now
+    # runs as an independent or for a minor party is counted apart, since they
+    # bring a personal vote the other party has never had
     moved_all = matches.join(candidates.select("year", "riding", "candidate", "party"), on=["year", "riding", "candidate"]).select(
         "year",
         "prev_riding",
         "riding",
         pl.col("party").replace_strict(MODEL_PARTY),
-        (pl.col("party") != pl.col("prev_party")).alias("switched"),
+        ((pl.col("party") == "other") & (pl.col("prev_party") != "other")).alias("switched"),
     )
 
     # 2026 is on the 2024 map
@@ -178,7 +178,7 @@ def incumbency(results: pl.DataFrame, candidates: pl.DataFrame, matches: pl.Data
         .group_by("year", pl.col("new_riding").alias("riding"))
         .agg(
             *(share(p, False).alias(f"incumbent_{p}") for p in RUNNING_PARTIES),
-            *(share(p, True).alias(f"switched_{p}") for p in RUNNING_PARTIES),
+            share("other", True).alias("switched_other"),
         )
     )
 
@@ -273,7 +273,7 @@ def run(args: argparse.Namespace) -> int:
             ]
         )
         .join(incumbency(results, candidates, matches), on=["year", "riding"], how="left")
-        .with_columns(pl.col(f"{kind}_{p}").fill_null(0.0) for kind in ("incumbent", "switched") for p in RUNNING_PARTIES)
+        .with_columns(pl.col(*(f"incumbent_{p}" for p in RUNNING_PARTIES), "switched_other").fill_null(0.0))
         .sort("year", "riding")
     )
 
