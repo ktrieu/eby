@@ -3,8 +3,14 @@
 Run fit_model first, without --holdout so the fit has seen 2024. Swings each
 riding from its 2024 result by the change from the 2024 topline to the one
 given (--ndp, --right, --green, --other, in percent; only their ratios matter,
-so they needn't add to 100), using the 2024 demographics. A party runs in a
-riding in 2026 wherever it had a 2024 logit.
+so they needn't add to 100), using the 2024 demographics.
+
+Who runs where comes from raw_data/candidates_2026.csv, a yes/no per riding
+for each party on the ballot. The Conservatives are "right", and CentreBC,
+OneBC and everyone else are "other". A party running where it had no 2024
+logit starts from the 2024 provincial logit instead, as if the riding were
+average. Ridings without an NDP candidate can't be modeled, since every logit
+is against the NDP; they go to the winner set in FIXED_WINNERS.
 
 For each posterior draw, takes every riding's vote shares and its plurality
 winner, and counts each party's seats. Writes the p5/p25/p50/p75/p95 of each
@@ -20,6 +26,7 @@ import sys
 
 import arviz as az
 import polars as pl
+import xarray as xr
 
 from commands.fit_model import (
     DEFAULT_TRACE,
@@ -28,10 +35,27 @@ from commands.fit_model import (
     load_dataset,
     predict_shares,
 )
-from paths import processed_path
+from paths import RAW_DATA_DIR, processed_path
 
 PREV_YEAR = 2024
 YEAR = 2026
+
+CANDIDATES_CSV = RAW_DATA_DIR / "candidates_2026.csv"
+
+# the model party each column of the candidates file runs under
+CANDIDATE_PARTIES = {
+    "ndp": "ndp",
+    "conservative": "right",
+    "centrebc": "other",
+    "green": "green",
+    "onebc": "other",
+    "other": "other",
+}
+
+# ridings with no NDP candidate, and who takes them. Peace River North is the
+# incumbent Jordan Kealy (independent, elected as a Conservative) against the
+# Conservatives; we call it for Kealy
+FIXED_WINNERS = {"Peace River North": "other"}
 
 DEFAULT_OUTPUT = "prediction.parquet"
 DEFAULT_SEATS_OUTPUT = "prediction_seats.parquet"
@@ -74,29 +98,62 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def build_frame(dataset: pl.DataFrame, topline: dict[str, float]) -> pl.DataFrame:
+def load_candidates() -> pl.DataFrame:
+    """Read which model parties run in each riding, as running_<party> booleans."""
+    candidates = pl.read_csv(CANDIDATES_CSV).with_columns(
+        pl.col(c).replace_strict({"yes": True, "no": False})
+        for c in CANDIDATE_PARTIES
+    )
+    return candidates.select(
+        "riding",
+        *[
+            pl.any_horizontal(
+                c for c, party in CANDIDATE_PARTIES.items() if party == p
+            ).alias(f"running_{p}")
+            for p in TOPLINE_PARTIES
+        ],
+    )
+
+
+def build_frame(
+    dataset: pl.DataFrame, candidates: pl.DataFrame, topline: dict[str, float]
+) -> pl.DataFrame:
     """Turn the 2024 rows into 2026 rows: 2024's results become the previous
     ones, and the topline is the one given."""
-    return dataset.filter(pl.col("year") == PREV_YEAR).select(
-        pl.lit(YEAR).alias("year"),
-        "riding",
-        *[pl.col(f"logit_{p}").alias(f"prev_logit_{p}") for p in MODEL_PARTIES],
-        *[
-            pl.col(f"topline_logit_{p}").alias(f"prev_topline_logit_{p}")
-            for p in MODEL_PARTIES
-        ],
-        *[
-            pl.lit(math.log(topline[p] / topline["ndp"])).alias(f"topline_logit_{p}")
-            for p in MODEL_PARTIES
-        ],
-        # there's no 2026 result, but build_model reads which parties ran from
-        # the observed logits. the values are placeholders that posterior
-        # predictive sampling ignores
-        *[
-            pl.when(pl.col(f"logit_{p}").is_not_null()).then(0.0).alias(f"logit_{p}")
-            for p in MODEL_PARTIES
-        ],
-        *DEMOG_COLS,
+    return (
+        dataset.filter(pl.col("year") == PREV_YEAR)
+        .join(candidates, on="riding", validate="1:1")
+        .filter(pl.col("running_ndp"))
+        .select(
+            pl.lit(YEAR).alias("year"),
+            "riding",
+            # a party not running has no logit. one running without a 2024
+            # logit starts from the province-wide one
+            *[
+                pl.when(pl.col(f"running_{p}"))
+                .then(pl.coalesce(f"logit_{p}", f"topline_logit_{p}"))
+                .alias(f"prev_logit_{p}")
+                for p in MODEL_PARTIES
+            ],
+            *[
+                pl.col(f"topline_logit_{p}").alias(f"prev_topline_logit_{p}")
+                for p in MODEL_PARTIES
+            ],
+            *[
+                pl.lit(math.log(topline[p] / topline["ndp"])).alias(
+                    f"topline_logit_{p}"
+                )
+                for p in MODEL_PARTIES
+            ],
+            # there's no 2026 result, but build_model reads which parties ran from
+            # the observed logits. the values are placeholders that posterior
+            # predictive sampling ignores
+            *[
+                pl.when(pl.col(f"running_{p}")).then(0.0).alias(f"logit_{p}")
+                for p in MODEL_PARTIES
+            ],
+            *DEMOG_COLS,
+        )
     )
 
 
@@ -132,13 +189,44 @@ def run(args: argparse.Namespace) -> int:
     if dataset is None:
         return 1
 
-    shares = predict_shares(trace, build_frame(dataset, topline), seed=args.seed)
+    if not CANDIDATES_CSV.exists():
+        print(f"missing {CANDIDATES_CSV}", file=sys.stderr)
+        return 1
+    candidates = load_candidates()
+
+    ridings_2024 = set(dataset.filter(pl.col("year") == PREV_YEAR)["riding"])
+    mismatched = ridings_2024 ^ set(candidates["riding"])
+    if mismatched:
+        print(
+            f"{CANDIDATES_CSV} and the {PREV_YEAR} ridings differ:"
+            f" {', '.join(sorted(mismatched))}",
+            file=sys.stderr,
+        )
+        return 1
+    unset = set(candidates.filter(~pl.col("running_ndp"))["riding"]) ^ set(
+        FIXED_WINNERS
+    )
+    if unset:
+        print(
+            "FIXED_WINNERS should be exactly the ridings without an NDP"
+            f" candidate, but differs on: {', '.join(sorted(unset))}",
+            file=sys.stderr,
+        )
+        return 1
+
+    shares = predict_shares(
+        trace, build_frame(dataset, candidates, topline), seed=args.seed
+    )
 
     # each riding goes to the party with the largest share in that draw. every
     # party gets a count in every draw, even when it's 0, so the quantiles
     # aren't taken over only the draws it won something
     won = shares == shares.max("party")
-    seats = won.sum("riding")
+    fixed = xr.DataArray(
+        [list(FIXED_WINNERS.values()).count(p) for p in shares.party.values],
+        coords={"party": shares.party},
+    )
+    seats = won.sum("riding") + fixed
     win = won.mean(("chain", "draw"))
     win.name = "win"
 
@@ -154,10 +242,21 @@ def run(args: argparse.Namespace) -> int:
         .rename({p: f"win_{p}" for p in TOPLINE_PARTIES})
     )
 
+    # fixed ridings have no shares, and a certain winner
+    fixed_ridings = pl.DataFrame(
+        [
+            {"riding": riding, **{f"win_{p}": float(p == winner) for p in TOPLINE_PARTIES}}
+            for riding, winner in FIXED_WINNERS.items()
+        ]
+    )
+
     ridings = (
         summarize(pl.DataFrame(shares), "share", ["riding"])
         .pivot("party", index="riding", values=list(QUANTILES))
         .join(win_chances, on="riding", validate="1:1")
+    )
+    ridings = (
+        pl.concat([ridings, fixed_ridings], how="diagonal_relaxed")
         .select(
             "riding",
             *[pl.col(f"{stat}_{p}") for stat in QUANTILES for p in TOPLINE_PARTIES],
