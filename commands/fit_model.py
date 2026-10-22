@@ -96,6 +96,15 @@ def load_dataset() -> pl.DataFrame | None:
         .join(demog, on=["year", "riding"], how="left", validate="1:1")
         .join(incumbency, on=["year", "riding"], how="left", validate="1:1")
         .join(prev_incumbency, on=["year", "riding"], how="left", validate="1:1")
+        # a party with nothing to swing from (it didn't run last time, or not
+        # across enough of the riding) starts from the province-wide logit, as
+        # if the riding were average. predict does the same for 2026
+        .with_columns(
+            pl.coalesce(f"prev_logit_{p}", f"prev_topline_logit_{p}").alias(
+                f"prev_logit_{p}"
+            )
+            for p in MODEL_PARTIES
+        )
     )
 
 
