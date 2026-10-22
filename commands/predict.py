@@ -5,9 +5,9 @@ riding from its 2024 result by the change from the 2024 topline to the one
 given (--ndp, --right, --green, --other, in percent; only their ratios matter,
 so they needn't add to 100), using the 2024 demographics.
 
-Who runs where comes from raw_data/candidates_2026.csv, a yes/no per riding
-for each party on the ballot. The Conservatives are "right", and CentreBC,
-OneBC and everyone else are "other". A party running where it had no 2024
+Run gen_candidates first too: who runs where comes from its 2026 rows. The
+Conservatives are "right", and CentreBC, OneBC and everyone else are
+"other". A party running where it had no 2024
 logit starts from the 2024 provincial logit instead, as if the riding were
 average. Ridings without an NDP candidate can't be modeled, since every logit
 is against the NDP; they go to the winner set in FIXED_WINNERS.
@@ -35,22 +35,11 @@ from commands.fit_model import (
     load_dataset,
     predict_shares,
 )
-from paths import RAW_DATA_DIR, processed_path
+from commands.gen_candidates import RIDING_CANDIDATES_PARQUET
+from paths import processed_path
 
 PREV_YEAR = 2024
 YEAR = 2026
-
-CANDIDATES_CSV = RAW_DATA_DIR / "candidates_2026.csv"
-
-# the model party each column of the candidates file runs under
-CANDIDATE_PARTIES = {
-    "ndp": "ndp",
-    "conservative": "right",
-    "centrebc": "other",
-    "green": "green",
-    "onebc": "other",
-    "other": "other",
-}
 
 # ridings with no NDP candidate, and who takes them. Peace River North is the
 # incumbent Jordan Kealy (independent, elected as a Conservative) against the
@@ -95,23 +84,6 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         type=processed_path,
         default=DEFAULT_SEATS_OUTPUT,
         help="seat counts file name, inside processed_data (default: %(default)s)",
-    )
-
-
-def load_candidates() -> pl.DataFrame:
-    """Read which model parties run in each riding, as running_<party> booleans."""
-    candidates = pl.read_csv(CANDIDATES_CSV).with_columns(
-        pl.col(c).replace_strict({"yes": True, "no": False})
-        for c in CANDIDATE_PARTIES
-    )
-    return candidates.select(
-        "riding",
-        *[
-            pl.any_horizontal(
-                c for c, party in CANDIDATE_PARTIES.items() if party == p
-            ).alias(f"running_{p}")
-            for p in TOPLINE_PARTIES
-        ],
     )
 
 
@@ -189,20 +161,15 @@ def run(args: argparse.Namespace) -> int:
     if dataset is None:
         return 1
 
-    if not CANDIDATES_CSV.exists():
-        print(f"missing {CANDIDATES_CSV}", file=sys.stderr)
-        return 1
-    candidates = load_candidates()
-
-    ridings_2024 = set(dataset.filter(pl.col("year") == PREV_YEAR)["riding"])
-    mismatched = ridings_2024 ^ set(candidates["riding"])
-    if mismatched:
+    if not RIDING_CANDIDATES_PARQUET.exists():
         print(
-            f"{CANDIDATES_CSV} and the {PREV_YEAR} ridings differ:"
-            f" {', '.join(sorted(mismatched))}",
+            f"missing {RIDING_CANDIDATES_PARQUET} (run gen_candidates first?)",
             file=sys.stderr,
         )
         return 1
+    candidates = pl.read_parquet(RIDING_CANDIDATES_PARQUET).filter(
+        pl.col("year") == YEAR
+    ).drop("year")
     unset = set(candidates.filter(~pl.col("running_ndp"))["riding"]) ^ set(
         FIXED_WINNERS
     )
