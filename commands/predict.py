@@ -4,7 +4,8 @@ Run fit_model first, without --holdout so the fit has seen 2024. Swings each
 riding from its 2024 result by the change from the 2024 topline to the one
 given (--ndp, --right, --green, --other, in percent; only their ratios matter,
 so they needn't add to 100), using the 2024 demographics, and moves it by
-the change from the 2024 incumbents to the sitting MLAs running in 2026.
+the change from the 2024 incumbents to the sitting MLAs running in 2026
+(and whether each runs for the party they were elected for).
 
 Run gen_candidates first too: who runs where comes from its 2026 rows. The
 Conservatives are "right", and CentreBC, OneBC and everyone else are

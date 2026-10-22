@@ -5,18 +5,18 @@ results; 2026 comes from raw_data/candidates_2026.csv, which has each party's
 candidates per 2023 riding ("; " between several, blank for none) and the
 sitting MLA, if they're running there, spelled as in the candidate columns.
 The results start at 2013, so the MLAs elected in 2009 come from
-raw_data/mlas_2009.csv, with each one's name as spelled in the 2013 results if
+raw_data/mlas_2009.csv, with each one's party and their name as spelled in the 2013 results if
 they ran again in the same riding (2009 and 2013 share a map). Writes two
 files:
 
 processed_data/candidates.parquet has one row per candidate on that
 election's own ridings, with their party (grouped as in gen_dataset, plus
 centrebc and onebc for 2026), whether they were elected (null for 2026), and
-whether they were the incumbent. In 2017 through 2024 the incumbent is whoever
-won that seat in the previous general election, matched by name wherever they
-ran; in 2013 only in the same riding. In 2026 it's the sitting MLA, counting
-floor crossings and by-elections. Names are "Last, First" before 2026, and
-"First Last" as on Wikipedia in 2026.
+whether they were the incumbent, and if so the party they won the seat for
+(prev_party). In 2017 through 2024 the incumbent is whoever won that seat in
+the previous general election, matched by name wherever they ran; in 2013 only
+in the same riding. In 2026 it's the sitting MLA. Names are "Last, First"
+before 2026, and "First Last" as on Wikipedia in 2026.
 
 processed_data/riding_candidates.parquet has one row per (election, 2023
 riding). running_<party> says whether each model party (ndp, right, green,
@@ -24,7 +24,9 @@ other) ran: before 2024 the ridings were different, so it's whether
 gen_dataset counts the party as contesting it, its candidates' old ridings
 covering at least MIN_COVERAGE of the votes. incumbent_<party> is the share of
 the riding's voters whose MLA from the previous election is on their ballot
-again running for that party. Across a boundary change we only
+again running for that party, the party they won the seat for, and
+switched_<party> the same for MLAs now running for that party after winning
+for another (Liberal to Conservative counts). Across a boundary change we only
 know how each map's ridings split the 2023 riding, not how they overlap each
 other, so we take an old riding and the new riding its MLA runs in to share
 as much of the 2023 riding as they can, the smaller of their two shares.
@@ -85,7 +87,7 @@ def read_2026() -> pl.DataFrame:
 
 
 def match_incumbents(candidates: pl.DataFrame, prev: int, year: int) -> pl.DataFrame:
-    """Find where each winner of the prev election ran in year, as (prev_riding, riding, candidate) rows.
+    """Find where each winner of the prev election ran in year, as (prev_riding, prev_party, riding, candidate) rows.
 
     Names don't always match exactly (middle names come and go, Greg is
     Gregory), so a winner matches a candidate with the same surname whose first
@@ -102,22 +104,23 @@ def match_incumbents(candidates: pl.DataFrame, prev: int, year: int) -> pl.DataF
     winners = keyed(candidates.filter((pl.col("year") == prev) & pl.col("elected")))
     running = keyed(candidates.filter(pl.col("year") == year))
     return (
-        winners.select(pl.col("riding").alias("prev_riding"), "last", "first")
+        winners.select(pl.col("riding").alias("prev_riding"), pl.col("party").alias("prev_party"), "last", "first")
         .join(running.select("riding", "candidate", "last", "first"), on="last", suffix="_now")
         .filter(pl.col("first").str.starts_with(pl.col("first_now")) | pl.col("first_now").str.starts_with(pl.col("first")))
         # a prefix can catch someone else too (Aman, Amandeep), so an exact
         # first name wins when there is one
         .with_columns(exact=pl.col("first") == pl.col("first_now"))
         .filter(pl.col("exact") | ~pl.col("exact").any().over("prev_riding"))
-        .select("prev_riding", "riding", "candidate")
+        .select("prev_riding", "prev_party", "riding", "candidate")
     )
 
 
 def incumbency(results: pl.DataFrame, candidates: pl.DataFrame, matches: pl.DataFrame) -> pl.DataFrame:
-    """Share of each 2023 riding's voters whose previous MLA is running again, per model party.
+    """Share of each 2023 riding's voters whose previous MLA is running again, per model party,
+    split by whether they're running for the party they won the seat for.
 
-    matches has each past incumbent running again, as (year, prev_riding,
-    riding, candidate).
+    matches has each incumbent running again, as (year, prev_riding,
+    prev_party, riding, candidate).
     """
     # how each election's ridings split up each 2023 riding
     pieces = (
@@ -127,18 +130,25 @@ def incumbency(results: pl.DataFrame, candidates: pl.DataFrame, matches: pl.Data
         .select("year", "riding", pl.col("riding_2024").alias("new_riding"), "share")
     )
 
-    # the party each incumbent runs for now, which may not be the one they won for
-    moved_all = matches.join(
-        candidates.select("year", "riding", "candidate", pl.col("party").replace_strict(MODEL_PARTY)),
-        on=["year", "riding", "candidate"],
+    # the party each incumbent runs for now, which may not be the one they won
+    # for. a switch between the Liberals and Conservatives counts, even though
+    # both are right
+    moved_all = matches.join(candidates.select("year", "riding", "candidate", "party"), on=["year", "riding", "candidate"]).select(
+        "year",
+        "prev_riding",
+        "riding",
+        pl.col("party").replace_strict(MODEL_PARTY),
+        (pl.col("party") != pl.col("prev_party")).alias("switched"),
     )
 
-    years = sorted(results["year"].unique())
+    # 2026 is on the 2024 map
+    maps = {**MAP_VERSIONS, 2026: MAP_VERSIONS[2024]}
+    years = sorted(maps)
     shares = []
     for prev, year in zip(years, years[1:]):
         moved = moved_all.filter(pl.col("year") == year).drop("year")
         before = pieces.filter(pl.col("year") == prev).drop("year").rename({"riding": "prev_riding"})
-        if MAP_VERSIONS[prev] == MAP_VERSIONS[year]:
+        if maps[prev] == maps[year]:
             # same map: the MLA's old voters are only on their ballot if they ran in the same riding
             overlap = moved.filter(pl.col("riding") == pl.col("prev_riding")).join(before, on="prev_riding")
         else:
@@ -148,27 +158,28 @@ def incumbency(results: pl.DataFrame, candidates: pl.DataFrame, matches: pl.Data
                 .join(after, on=["riding", "new_riding"], suffix="_now")
                 .with_columns(pl.min_horizontal("share", "share_now").alias("share"))
             )
-        shares.append(overlap.select(pl.lit(year, dtype=pl.Int64).alias("year"), "new_riding", "party", "share"))
+        shares.append(
+            overlap.select(pl.lit(year, dtype=pl.Int64).alias("year"), "new_riding", "party", "switched", "share")
+        )
 
     # 2009 and 2013 share a map, but there are no 2009 results to split it up
     # with, so the first election's incumbents use its own
     shares.append(
         moved_all.filter(pl.col("year") == years[0])
         .join(pieces, on=["year", "riding"])
-        .select("year", "new_riding", "party", "share")
+        .select("year", "new_riding", "party", "switched", "share")
     )
 
-    # 2026 is on the 2024 map, and the file already says which sitting MLA runs where
-    shares.append(
-        candidates.filter((pl.col("year") == 2026) & pl.col("incumbent")).select(
-            "year", pl.col("riding").alias("new_riding"), pl.col("party").replace_strict(MODEL_PARTY), share=pl.lit(1.0)
-        )
-    )
+    def share(party: str, switched: bool) -> pl.Expr:
+        return pl.col("share").filter((pl.col("party") == party) & (pl.col("switched") == switched)).sum()
 
     return (
         pl.concat(shares)
         .group_by("year", pl.col("new_riding").alias("riding"))
-        .agg((pl.col("share").filter(pl.col("party") == p).sum()).alias(f"incumbent_{p}") for p in RUNNING_PARTIES)
+        .agg(
+            *(share(p, False).alias(f"incumbent_{p}") for p in RUNNING_PARTIES),
+            *(share(p, True).alias(f"switched_{p}") for p in RUNNING_PARTIES),
+        )
     )
 
 
@@ -215,13 +226,25 @@ def run(args: argparse.Namespace) -> int:
 
     years = sorted(past["year"].unique())
     mlas_2009 = pl.read_csv(MLAS_2009_CSV).filter(pl.col("candidate").is_not_null())
+    # every sitting MLA running in 2026 is their riding's 2024 winner (no
+    # by-election winners are), so that's the party they won the seat for
+    winners_2024 = past.filter((pl.col("year") == years[-1]) & pl.col("elected")).select("riding", pl.col("party").alias("prev_party"))
     matches = pl.concat(
         [
-            mlas_2009.select(pl.lit(years[0], dtype=pl.Int64).alias("year"), pl.col("riding").alias("prev_riding"), "riding", "candidate"),
+            mlas_2009.select(
+                pl.lit(years[0], dtype=pl.Int64).alias("year"),
+                pl.col("riding").alias("prev_riding"),
+                pl.col("party").alias("prev_party"),
+                "riding",
+                "candidate",
+            ),
             *(
                 match_incumbents(past, prev, year).with_columns(pl.lit(year, dtype=pl.Int64).alias("year"))
                 for prev, year in zip(years, years[1:])
             ),
+            candidates_2026.filter(pl.col("incumbent"))
+            .join(winners_2024, on="riding")
+            .select("year", pl.col("riding").alias("prev_riding"), "prev_party", "riding", "candidate"),
         ],
         how="diagonal",
     )
@@ -235,13 +258,10 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     candidates = (
-        pl.concat(
-            [
-                past.join(matches.select("year", "riding", "candidate", incumbent=pl.lit(True)), on=["year", "riding", "candidate"], how="left")
-                .with_columns(pl.col("incumbent").fill_null(False)),
-                candidates_2026,
-            ]
-        )
+        pl.concat([past, candidates_2026.drop("incumbent")])
+        .join(matches.select("year", "riding", "candidate", "prev_party"), on=["year", "riding", "candidate"], how="left")
+        .with_columns(pl.col("prev_party").is_not_null().alias("incumbent"))
+        .select("year", "riding", "party", "candidate", "elected", "incumbent", "prev_party")
         .sort("year", "riding", "party", "candidate")
     )
 
@@ -253,7 +273,7 @@ def run(args: argparse.Namespace) -> int:
             ]
         )
         .join(incumbency(results, candidates, matches), on=["year", "riding"], how="left")
-        .with_columns(pl.col(f"incumbent_{p}").fill_null(0.0) for p in RUNNING_PARTIES)
+        .with_columns(pl.col(f"{kind}_{p}").fill_null(0.0) for kind in ("incumbent", "switched") for p in RUNNING_PARTIES)
         .sort("year", "riding")
     )
 
