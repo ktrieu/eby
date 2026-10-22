@@ -220,17 +220,25 @@ def left_other(results: pl.DataFrame, candidates: pl.DataFrame) -> pl.DataFrame:
             .join(vote_shares, on=["year", "riding", "candidate"])
             .filter(pl.col("vote_share") >= MIN_PERSONAL_SHARE)
         )
-        now = candidates.filter((pl.col("year") == year) & (pl.col("party") == "other"))
+        now = candidates.filter(pl.col("year") == year).with_columns(
+            pl.col("party").replace_strict(MODEL_PARTY).alias("now_party")
+        )
         if year == 2026:
             # 2026 names are "First Last", and surnames can be more than one word
             now = now.select(
                 pl.col("candidate").str.to_lowercase().alias("full"),
                 pl.col("candidate").str.split(" ").list.first().str.to_lowercase().alias("first"),
+                "now_party",
             )
-            stayed = strong.join(now, on="first").filter(pl.col("full").str.ends_with(" " + pl.col("last")))
+            ran = strong.join(now, on="first").filter(pl.col("full").str.ends_with(" " + pl.col("last")))
         else:
-            stayed = strong.join(keyed(now).select("last", "first"), on=["last", "first"])
-        left = strong.join(stayed.select("riding", "candidate"), on=["riding", "candidate"], how="anti")
+            ran = strong.join(keyed(now).select("last", "first", "now_party"), on=["last", "first"])
+        # where each one runs now, if anywhere. still other (an independent
+        # again, or CentreBC or OneBC) means their vote stays on the other line
+        left = (
+            strong.join(ran.select("riding", "candidate", "now_party"), on=["riding", "candidate"], how="left")
+            .filter(pl.col("now_party").fill_null("") != "other")
+        )
         rows.append(
             left.select("year", "riding")
             .unique()
