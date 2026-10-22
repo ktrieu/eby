@@ -12,12 +12,9 @@ import argparse
 import sys
 
 import arviz as az
-import numpy as np
 import polars as pl
-import pymc as pm
-import xarray as xr
 
-from commands.fit_model import MODEL_PARTIES, build_model, load_dataset
+from commands.fit_model import MODEL_PARTIES, load_dataset, predict_shares
 from commands.fit_model import DEFAULT_TRACE
 from paths import processed_path
 
@@ -60,37 +57,7 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     test = dataset.filter(pl.col("year") == holdout)
-    test_model = build_model(test)
-    with test_model:
-        ppc = pm.sample_posterior_predictive(
-            trace, model=test_model, predictions=True
-        )
-
-    preds = ppc["predictions"]
-    # one table for each unique pattern. (chains, draw, parties_in_pattern, riding)
-    # parties_in_pattern can vary (if only two parties are running its two)
-    parts = [
-        preds[var].rename({f"riding_{tag}": "riding", f"party_{tag}": "party"})
-        for var in preds.data_vars
-        for tag in [var.removeprefix("logit_")]
-    ]
-
-    # glue together all our pieces along the riding column, essentially all our pieces into one big frame.
-    # join = "outer" fills in missing parties with NaN.
-    pred = xr.concat(parts, dim="riding", join="outer")
-    # reindex the parties to a fixed order across the whole frame.
-    pred = pred.reindex(party=MODEL_PARTIES)
-
-    # softmax each draw into vote shares. logits are against the NDP, which adds
-    # exp(0) = 1 to the denominator; a party that didn't run (NaN) gets 0 votes
-    e = np.exp(pred).fillna(0)
-    denom = 1 + e.sum("party")
-    shares = xr.concat(
-        [e / denom, (1 / denom).expand_dims(party=["ndp"])],
-        dim="party",
-    )
-    # concat leaves party as an object-dtype coord, which arrow can't convert
-    shares = shares.assign_coords(party=shares.party.astype(str))
+    shares = predict_shares(trace, test)
 
     shares = shares.stack(sample=("chain", "draw")).reset_index("sample")
     shares.name = "share"
