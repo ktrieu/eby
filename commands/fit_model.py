@@ -1,6 +1,6 @@
 """Fit the riding model to the dataset and save its posterior.
 
-Run gen_dataset first. Samples the model with PyMC and writes the trace to
+Run gen_dataset and gen_demog first. Samples the model with PyMC and writes the trace to
 processed_data/trace.nc (or the --output name in processed_data) for later
 commands to read without refitting. With --holdout, that year is left out of the fit and recorded in the
 trace for backtest to evaluate against.
@@ -14,6 +14,7 @@ import polars as pl
 import pymc as pm
 
 from commands.gen_dataset import OUTPUT_PARQUET as MODEL_INPUT_PARQUET
+from commands.gen_demog import OUTPUT_PARQUET as DEMOG_PARQUET
 from paths import processed_path
 
 DEFAULT_TRACE = "trace.nc"
@@ -51,10 +52,31 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 MODEL_PARTIES = ["green", "right", "other"]
 
+# standardized census rates from gen_demog, each with a fixed effect per party
+DEMOG_COLS = ["postsecondary_z", "visible_minority_z"]
+
+
+def load_dataset() -> pl.DataFrame | None:
+    """Read the model input with each riding's demographics joined on, or
+    print what's missing and return None."""
+    missing = [p for p in (MODEL_INPUT_PARQUET, DEMOG_PARQUET) if not p.exists()]
+    if missing:
+        print(
+            f"missing {', '.join(map(str, missing))} (run gen_dataset and gen_demog first?)",
+            file=sys.stderr,
+        )
+        return None
+
+    demog = pl.read_parquet(DEMOG_PARQUET).select("year", "riding", *DEMOG_COLS)
+    return pl.read_parquet(MODEL_INPUT_PARQUET).join(
+        demog, on=["year", "riding"], how="left", validate="1:1"
+    )
+
 
 def build_model(dataset: pl.DataFrame) -> pm.Model:
     """Build the logit swing model: each riding's result is its previous result
-    shifted on the logit scale by the province-wide swing, plus riding noise."""
+    shifted on the logit scale by the province-wide swing and a demographic
+    effect, plus riding noise."""
 
     # right is lib + con
     coords = {
@@ -62,6 +84,7 @@ def build_model(dataset: pl.DataFrame) -> pm.Model:
         "party_": MODEL_PARTIES,
         "year": dataset["year"].unique().sort().to_list(),
         "riding": dataset["riding"].unique().sort().to_list(),
+        "demog": DEMOG_COLS,
         # the index of each row in the dataset
         "obs": range(dataset.height),
     }
@@ -75,6 +98,7 @@ def build_model(dataset: pl.DataFrame) -> pm.Model:
         [f"prev_topline_logit_{p}" for p in MODEL_PARTIES]
     ).to_numpy()
     topline_swing = topline_logit - prev_topline_logit
+    demog = dataset.select(DEMOG_COLS).to_numpy()
 
     # one row for each observation, each column is a boolean: "do we have NaNs for this party"?
     valid = ~np.isnan(logit) & ~np.isnan(prev_logit) & ~np.isnan(topline_swing)
@@ -95,7 +119,11 @@ def build_model(dataset: pl.DataFrame) -> pm.Model:
 
         cov = chol @ chol.T
 
-        predicted_logit = prev_logit + topline_swing
+        # how much each party's swing moves per standard deviation of each
+        # demographic, the same in every election
+        beta = pm.Normal("beta", mu=0, sigma=0.25, dims=("party", "demog"))
+
+        predicted_logit = prev_logit + topline_swing + demog @ beta.T
 
         # Some rows have nulls (Green for example). We have to split these up and handle them with separate distributions.
 
@@ -142,15 +170,9 @@ def build_model(dataset: pl.DataFrame) -> pm.Model:
 
 
 def run(args: argparse.Namespace) -> int:
-    missing = [p for p in (MODEL_INPUT_PARQUET,) if not p.exists()]
-    if missing:
-        print(
-            f"missing {', '.join(map(str, missing))} (run gen_dataset first?)",
-            file=sys.stderr,
-        )
+    dataset = load_dataset()
+    if dataset is None:
         return 1
-
-    dataset = pl.read_parquet(MODEL_INPUT_PARQUET)
 
     train = dataset
     if args.holdout:

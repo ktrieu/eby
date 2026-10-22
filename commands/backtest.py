@@ -17,9 +17,8 @@ import polars as pl
 import pymc as pm
 import xarray as xr
 
-from commands.fit_model import MODEL_PARTIES, build_model
+from commands.fit_model import MODEL_PARTIES, build_model, load_dataset
 from commands.fit_model import DEFAULT_TRACE
-from commands.gen_dataset import OUTPUT_PARQUET as MODEL_INPUT_PARQUET
 from paths import processed_path
 
 DEFAULT_OUTPUT = "backtest.parquet"
@@ -43,12 +42,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def run(args: argparse.Namespace) -> int:
-    missing = [p for p in (MODEL_INPUT_PARQUET, args.trace) if not p.exists()]
-    if missing:
-        print(
-            f"missing {', '.join(map(str, missing))} (run gen_dataset and fit_model first?)",
-            file=sys.stderr,
-        )
+    if not args.trace.exists():
+        print(f"missing {args.trace} (run fit_model first?)", file=sys.stderr)
         return 1
 
     trace = az.from_netcdf(args.trace)
@@ -60,7 +55,9 @@ def run(args: argparse.Namespace) -> int:
         )
         return 1
 
-    dataset = pl.read_parquet(MODEL_INPUT_PARQUET)
+    dataset = load_dataset()
+    if dataset is None:
+        return 1
 
     test = dataset.filter(pl.col("year") == holdout)
     test_model = build_model(test)
