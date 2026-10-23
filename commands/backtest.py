@@ -1,8 +1,9 @@
 """Backtest a held-out fit against the year it never saw.
 
 Run fit_model with --holdout first. Predicts each riding in the held-out year
-from the trace's posterior, compares the predicted vote shares to the actual
-results, and writes per-riding metrics (summary stats, actual share, signed
+from the trace's posterior and that year's polls (not its actual topline),
+compares the predicted vote shares to the actual results, and writes
+per-riding metrics (summary stats, actual share, signed
 error, 50/90% interval coverage, predicted and actual swing from the previous
 election in percentage points, predicted and actual winner) to
 processed_data/backtest.parquet (or the --output name in processed_data).
@@ -14,7 +15,7 @@ import sys
 import arviz as az
 import polars as pl
 
-from commands.fit_model import MODEL_PARTIES, load_dataset, predict_shares
+from commands.fit_model import MODEL_PARTIES, load_dataset, load_toplines, predict_shares
 from commands.fit_model import DEFAULT_TRACE
 from paths import processed_path
 
@@ -57,7 +58,7 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     test = dataset.filter(pl.col("year") == holdout)
-    shares = predict_shares(trace, test)
+    shares = predict_shares(trace, test, load_toplines())
 
     shares = shares.stack(sample=("chain", "draw")).reset_index("sample")
     shares.name = "share"

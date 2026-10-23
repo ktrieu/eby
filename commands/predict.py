@@ -1,11 +1,12 @@
-"""Predict the 2026 election from a fitted trace and a provincial topline.
+"""Predict the 2026 election from a fitted trace and the 2026 polls.
 
 Run fit_model first, without --holdout so the fit has seen 2024. Swings each
-riding from its 2024 result by the change from the 2024 topline to the one
-given (--ndp, --right, --green, --other, in percent; only their ratios matter,
-so they needn't add to 100), using the 2024 demographics, and moves it by
-the change from the 2024 incumbents to the sitting MLAs running in 2026
-(and whether each runs for the party they were elected for).
+riding from its 2024 result by the change from the 2024 topline to the 2026
+poll average plus a drawn polling error, and by its region's swing in the
+regional polls plus a drawn regional error (gen_polls makes both averages),
+using the 2024 demographics, and moves it by the change from the 2024
+incumbents to the sitting MLAs running in 2026 (and whether each runs for the
+party they were elected for).
 
 Run gen_candidates first too: who runs where comes from its 2026 rows. The
 Conservatives are "right", and CentreBC, OneBC and everyone else are
@@ -23,7 +24,6 @@ processed_data/prediction_seats.parquet (or the --seats-output name).
 """
 
 import argparse
-import math
 import sys
 
 import arviz as az
@@ -38,7 +38,9 @@ from commands.fit_model import (
     MODEL_PARTIES,
     PREV_INCUMBENT_COLS,
     load_dataset,
+    load_toplines,
     predict_shares,
+    with_region_poll_swings,
 )
 from commands.gen_candidates import RIDING_CANDIDATES_PARQUET
 from paths import processed_path
@@ -68,13 +70,6 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         help="trace file name in processed_data, written by fit_model"
         " (default: %(default)s)",
     )
-    for party in TOPLINE_PARTIES:
-        parser.add_argument(
-            f"--{party}",
-            type=float,
-            required=True,
-            help=f"{YEAR} provincial vote share for {party}, in percent",
-        )
     parser.add_argument(
         "--seed", type=int, default=None, help="random seed, for reproducible draws"
     )
@@ -92,12 +87,10 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def build_frame(
-    dataset: pl.DataFrame, candidates: pl.DataFrame, topline: dict[str, float]
-) -> pl.DataFrame:
+def build_frame(dataset: pl.DataFrame, candidates: pl.DataFrame) -> pl.DataFrame:
     """Turn the 2024 rows into 2026 rows: 2024's results and incumbency become
-    the previous ones, and the topline is the one given."""
-    return (
+    the previous ones."""
+    frame = (
         dataset.filter(pl.col("year") == PREV_YEAR)
         .drop(*PREV_INCUMBENT_COLS, LEFT_OTHER_COL)
         .rename(dict(zip(INCUMBENT_COLS, PREV_INCUMBENT_COLS)))
@@ -119,12 +112,6 @@ def build_frame(
                 pl.col(f"topline_logit_{p}").alias(f"prev_topline_logit_{p}")
                 for p in MODEL_PARTIES
             ],
-            *[
-                pl.lit(math.log(topline[p] / topline["ndp"])).alias(
-                    f"topline_logit_{p}"
-                )
-                for p in MODEL_PARTIES
-            ],
             # there's no 2026 result, but build_model reads which parties ran from
             # the observed logits. the values are placeholders that posterior
             # predictive sampling ignores
@@ -138,6 +125,7 @@ def build_frame(
             LEFT_OTHER_COL,
         )
     )
+    return with_region_poll_swings(frame)
 
 
 def summarize(frame: pl.DataFrame, value: str, by: list[str]) -> pl.DataFrame:
@@ -150,15 +138,6 @@ def summarize(frame: pl.DataFrame, value: str, by: list[str]) -> pl.DataFrame:
 def run(args: argparse.Namespace) -> int:
     if not args.trace.exists():
         print(f"missing {args.trace} (run fit_model first?)", file=sys.stderr)
-        return 1
-
-    topline = {p: getattr(args, p) for p in TOPLINE_PARTIES}
-    nonpositive = [p for p, share in topline.items() if share <= 0]
-    if nonpositive:
-        print(
-            f"topline shares must be positive: {', '.join(nonpositive)}",
-            file=sys.stderr,
-        )
         return 1
 
     trace = az.from_netcdf(args.trace)
@@ -192,8 +171,13 @@ def run(args: argparse.Namespace) -> int:
         )
         return 1
 
+    toplines = load_toplines()
+    if YEAR not in toplines["year"]:
+        print(f"no {YEAR} polls (run gen_polls first?)", file=sys.stderr)
+        return 1
+
     shares = predict_shares(
-        trace, build_frame(dataset, candidates, topline), seed=args.seed
+        trace, build_frame(dataset, candidates), toplines, seed=args.seed
     )
 
     # each riding goes to the party with the largest share in that draw. every

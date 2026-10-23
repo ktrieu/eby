@@ -1,9 +1,14 @@
 """Fit the riding model to the dataset and save its posterior.
 
-Run gen_dataset, gen_demog and gen_candidates first. Samples the model with PyMC and writes the trace to
+Run gen_dataset, gen_demog, gen_candidates and gen_polls first. Samples the model with PyMC and writes the trace to
 processed_data/trace.nc (or the --output name in processed_data) for later
 commands to read without refitting. With --holdout, that year is left out of the fit and recorded in the
 trace for backtest to evaluate against.
+
+Each election's provincial vote is its poll average plus a polling error. The
+fit sees the actual toplines of every past election with polls (even 2013,
+which has no rows of its own), so it learns how far off the polls usually are;
+predictions draw a fresh error around the polls instead.
 """
 
 import argparse
@@ -13,12 +18,15 @@ import arviz as az
 import numpy as np
 import polars as pl
 import pymc as pm
+import pytensor.tensor as pt
 import xarray as xr
 
 from commands.gen_candidates import RIDING_CANDIDATES_PARQUET
 from commands.gen_dataset import OUTPUT_PARQUET as MODEL_INPUT_PARQUET
-from commands.gen_dataset import as_previous
+from commands.gen_dataset import TOPLINES_CSV, as_previous
 from commands.gen_demog import OUTPUT_PARQUET as DEMOG_PARQUET
+from commands.gen_polls import OUTPUT_PARQUET as POLLS_PARQUET
+from commands.gen_polls import REGION_SWINGS_PARQUET
 from paths import RAW_DATA_DIR, processed_path
 
 DEFAULT_TRACE = "trace.nc"
@@ -72,9 +80,49 @@ LEFT_OTHER_COL = "left_other"
 REGIONS_CSV = RAW_DATA_DIR / "regions.csv"
 
 
+def logits(shares: dict[str, pl.Expr]) -> list[pl.Expr]:
+    """Each model party's logit against the NDP, from its share (or votes)."""
+    return [(shares[p] / shares["ndp"]).log() for p in MODEL_PARTIES]
+
+
+def load_toplines() -> pl.DataFrame:
+    """One row per election with polls: its poll average's logits
+    (poll_logit_<party>) and the actual result's (logit_<party>, null for an
+    election that hasn't happened yet)."""
+    shares = {p: pl.col(p) for p in MODEL_PARTIES + ["ndp"]}
+
+    def select_logits(frame: pl.DataFrame, prefix: str) -> pl.DataFrame:
+        return frame.select(
+            "year",
+            *(e.alias(f"{prefix}logit_{p}") for p, e in zip(MODEL_PARTIES, logits(shares))),
+        )
+
+    polls = pl.read_parquet(POLLS_PARQUET)
+    actual = pl.read_csv(TOPLINES_CSV).with_columns(
+        right=pl.col("liberal") + pl.col("conservative")
+    )
+    return (
+        select_logits(polls, "poll_")
+        .join(select_logits(actual, ""), on="year", how="left")
+        .sort("year")
+    )
+
+
+def with_region_poll_swings(frame: pl.DataFrame) -> pl.DataFrame:
+    """Add each row's region's swing against the province in the regional polls
+    (region_poll_swing_<party>, from gen_polls). A region without one gets no
+    poll swing."""
+    swings = pl.read_parquet(REGION_SWINGS_PARQUET).select(
+        "year", "region", *(f"region_poll_swing_{p}" for p in MODEL_PARTIES)
+    )
+    return frame.join(swings, on=["year", "region"], how="left", validate="m:1").with_columns(
+        pl.col(f"region_poll_swing_{p}").fill_null(0.0) for p in MODEL_PARTIES
+    )
+
+
 def load_dataset() -> pl.DataFrame | None:
-    """Read the model input with each riding's demographics and incumbency
-    joined on, or print what's missing and return None."""
+    """Read the model input with each riding's demographics, incumbency and
+    regional poll swing joined on, or print what's missing and return None."""
     missing = [
         p
         for p in (
@@ -82,12 +130,14 @@ def load_dataset() -> pl.DataFrame | None:
             DEMOG_PARQUET,
             RIDING_CANDIDATES_PARQUET,
             REGIONS_CSV,
+            POLLS_PARQUET,
+            REGION_SWINGS_PARQUET,
         )
         if not p.exists()
     ]
     if missing:
         print(
-            f"missing {', '.join(map(str, missing))} (run gen_dataset, gen_demog and gen_candidates first?)",
+            f"missing {', '.join(map(str, missing))} (run gen_dataset, gen_demog, gen_candidates and gen_polls first?)",
             file=sys.stderr,
         )
         return None
@@ -117,23 +167,42 @@ def load_dataset() -> pl.DataFrame | None:
             )
             for p in MODEL_PARTIES
         )
+        .pipe(with_region_poll_swings)
     )
 
 
-def build_model(dataset: pl.DataFrame) -> pm.Model:
+def build_model(dataset: pl.DataFrame, toplines: pl.DataFrame) -> pm.Model:
     """Build the logit swing model: each riding's result is its previous result
     shifted on the logit scale by the province-wide swing, its region's swing
     that election, a demographic effect and the change in incumbency, plus
-    riding noise."""
+    riding noise.
+
+    The province-wide vote is the poll average plus a polling error, and each
+    region's swing is the one its polls point to plus a regional polling
+    error. toplines (from load_toplines) has a row for every election in the
+    dataset, and may have more: an election with an actual result pins its
+    polling error, one without (null logits) draws it."""
 
     years = dataset["year"].unique().sort().to_list()
     regions = pl.read_csv(REGIONS_CSV)["region"].unique().sort().to_list()
+    topline_years = toplines["year"].to_list()
+    if not set(years) <= set(topline_years):
+        raise ValueError(f"no poll average for {sorted(set(years) - set(topline_years))}")
+
+    poll_topline = toplines.select([f"poll_logit_{p}" for p in MODEL_PARTIES]).to_numpy()
+    observed_error = (
+        toplines.select([f"logit_{p}" for p in MODEL_PARTIES]).to_numpy() - poll_topline
+    )
+    known = ~np.isnan(observed_error).any(axis=1)
 
     # right is lib + con
     coords = {
         "party": MODEL_PARTIES,
         "party_": MODEL_PARTIES,
         "year": years,
+        "topline_year": topline_years,
+        "known_year": [y for y, k in zip(topline_years, known) if k],
+        "new_year": [y for y, k in zip(topline_years, known) if not k],
         "region": regions,
         "riding": dataset["riding"].unique().sort().to_list(),
         "demog": DEMOG_COLS,
@@ -143,13 +212,12 @@ def build_model(dataset: pl.DataFrame) -> pm.Model:
 
     logit = dataset.select([f"logit_{p}" for p in MODEL_PARTIES]).to_numpy()
     prev_logit = dataset.select([f"prev_logit_{p}" for p in MODEL_PARTIES]).to_numpy()
-    topline_logit = dataset.select(
-        [f"topline_logit_{p}" for p in MODEL_PARTIES]
-    ).to_numpy()
     prev_topline_logit = dataset.select(
         [f"prev_topline_logit_{p}" for p in MODEL_PARTIES]
     ).to_numpy()
-    topline_swing = topline_logit - prev_topline_logit
+    region_poll_swing = dataset.select(
+        [f"region_poll_swing_{p}" for p in MODEL_PARTIES]
+    ).to_numpy()
     demog = dataset.select(DEMOG_COLS).to_numpy()
 
     # logits are against the NDP, so an NDP incumbent counts against every
@@ -175,9 +243,38 @@ def build_model(dataset: pl.DataFrame) -> pm.Model:
     ).to_numpy()
 
     # one row for each observation, each column is a boolean: "do we have NaNs for this party"?
-    valid = ~np.isnan(logit) & ~np.isnan(prev_logit) & ~np.isnan(topline_swing)
+    valid = ~np.isnan(logit) & ~np.isnan(prev_logit) & ~np.isnan(prev_topline_logit)
 
     with pm.Model(coords=coords) as model:
+        # how far the final polls miss each party's provincial logit. the
+        # elections with results observe their miss directly; the rest draw
+        # one, which carries through to every riding alike. the small parties
+        # have missed by 0.4 or more on the logit scale, so the prior is wide
+        topline_sigma = pm.HalfNormal("topline_sigma", sigma=0.5, dims="party")
+        topline_error = pt.as_tensor(np.nan_to_num(observed_error))
+        if known.any():
+            pm.Normal(
+                "topline_error",
+                mu=0,
+                sigma=topline_sigma,
+                observed=observed_error[known],
+                dims=("known_year", "party"),
+            )
+        if not known.all():
+            topline_error = pt.set_subtensor(
+                topline_error[np.flatnonzero(~known)],
+                pm.Normal(
+                    "topline_error_new", mu=0, sigma=topline_sigma, dims=("new_year", "party")
+                ),
+            )
+        topline_logit = pm.Deterministic(
+            "topline_logit", poll_topline + topline_error, dims=("topline_year", "party")
+        )
+        topline_swing = (
+            topline_logit[np.searchsorted(topline_years, dataset["year"].to_numpy())]
+            - prev_topline_logit
+        )
+
         # covariance matrix from party -> party
         chol, corr, sigma = pm.LKJCholeskyCov(
             "chol",
@@ -206,9 +303,10 @@ def build_model(dataset: pl.DataFrame) -> pm.Model:
         switched_other = pm.Normal("switched_other", mu=0, sigma=2)
 
         # each region swings a little differently from the province in each
-        # election (Surrey and the Island went much further right in 2024), so
-        # these are fresh every election, pooled by how far regions usually
-        # stray. an election the trace never saw draws new ones
+        # election (Surrey and the Island went much further right in 2024).
+        # the regional polls say roughly how, and these are how far off they
+        # are: fresh every election, pooled by how far the regional polls
+        # usually miss. an election the trace never saw draws new ones
         region_sigma = pm.HalfNormal("region_sigma", sigma=0.3, dims="party")
         region_z = pm.Normal("region_z", mu=0, sigma=1, dims=("year", "region", "party"))
         region_swing = region_z * region_sigma
@@ -218,6 +316,7 @@ def build_model(dataset: pl.DataFrame) -> pm.Model:
         predicted_logit = (
             prev_logit
             + topline_swing
+            + region_poll_swing
             + region_swing[year_index, region_index]
             + demog @ beta.T
             + incumbency * incumbency_swing
@@ -269,20 +368,36 @@ def build_model(dataset: pl.DataFrame) -> pm.Model:
 
 
 def predict_shares(
-    trace: az.InferenceData, dataset: pl.DataFrame, seed: int | None = None
+    trace: az.InferenceData,
+    dataset: pl.DataFrame,
+    toplines: pl.DataFrame,
+    seed: int | None = None,
 ) -> xr.DataArray:
     """Draw each riding's vote shares in the dataset from the trace's posterior,
     as a (chain, draw, riding, party) array with the NDP included. A party that
-    didn't run gets a share of 0."""
-    model = build_model(dataset)
+    didn't run gets a share of 0.
+
+    The elections are predicted from their polls alone: any actual results in
+    toplines are ignored, and the polling error is drawn from topline_sigma."""
+    toplines = toplines.filter(
+        pl.col("year").is_in(dataset["year"].unique().to_list())
+    ).with_columns(pl.lit(None, dtype=pl.Float64).alias(f"logit_{p}") for p in MODEL_PARTIES)
+    model = build_model(dataset, toplines)
     with model:
-        # the regional swings for these elections weren't in the fit, so draw
-        # them fresh from region_sigma. pymc would pass the trace's (the
-        # training elections') straight through, so drop them first
+        # the polling and regional errors for these elections weren't in the
+        # fit, so draw them fresh from topline_sigma and region_sigma. pymc
+        # would pass the trace's (the training elections') straight through,
+        # so drop them first
         ppc = pm.sample_posterior_predictive(
-            trace.posterior.to_dataset().drop_vars("region_z", errors="ignore"),
+            trace.posterior.to_dataset().drop_vars(
+                ["region_z", "topline_logit"], errors="ignore"
+            ),
             model=model,
-            var_names=["region_z", *(v.name for v in model.observed_RVs)],
+            var_names=[
+                "region_z",
+                "topline_error_new",
+                *(v.name for v in model.observed_RVs),
+            ],
             predictions=True,
             random_seed=seed,
         )
@@ -320,11 +435,16 @@ def run(args: argparse.Namespace) -> int:
     if dataset is None:
         return 1
 
+    # every past election with polls and a result anchors the polling error,
+    # including ones too early to have riding rows of their own
+    toplines = load_toplines().drop_nulls()
+
     train = dataset
     if args.holdout:
         train = train.filter(pl.col("year") != args.holdout)
+        toplines = toplines.filter(pl.col("year") != args.holdout)
 
-    train_model = build_model(train)
+    train_model = build_model(train, toplines)
     with train_model:
         trace = pm.sample(
             draws=args.draws, tune=args.tune, chains=args.chains, random_seed=args.seed
